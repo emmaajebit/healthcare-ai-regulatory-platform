@@ -1,8 +1,41 @@
-# This file should be encrypted with ansible-vault:
-# ansible-vault encrypt ansible/playbooks/group_vars/all.yml
+# group_vars/all.yml — Static defaults and Secrets Manager ARN references.
+# Actual secret values are NEVER stored here; they are fetched at playbook
+# runtime via community.aws.aws_secret using the ARNs below.
 #
-# Encrypt with: ansible-vault encrypt ansible/playbooks/group_vars/all.yml
-# Edit with:    ansible-vault edit ansible/playbooks/group_vars/all.yml
+# This file is overwritten by scripts/terraform-to-ansible.sh after each
+# terraform apply. The ARNs below are seeds for local development.
+#
+# To encrypt with ansible-vault:
+#   ansible-vault encrypt ansible/playbooks/group_vars/all.yml
 
-argocd_admin_password: "CHANGE_ME_ENCRYPT_WITH_VAULT"
-helm_repo_token: "CHANGE_ME_ENCRYPT_WITH_VAULT"
+# ── Infrastructure (populated by terraform-to-ansible.sh) ────────────────────
+aws_region: "us-east-1"
+eks_cluster_name: "healthcare-ai-eks"
+ecr_repository_url: ""
+opensearch_endpoint: ""
+s3_worm_bucket: ""
+dynamodb_audit_table: ""
+
+# ── IAM / OIDC ────────────────────────────────────────────────────────────────
+terraform_deployer_role_arn: ""   # set by terraform-to-ansible.sh
+terraform_planner_role_arn: ""
+secrets_reader_policy_arn: ""
+
+# ── Secrets Manager ARNs ──────────────────────────────────────────────────────
+# Values are fetched at runtime — example task:
+#
+#   - name: Read ArgoCD password
+#     community.aws.aws_secret:
+#       name: "{{ argocd_secret_arn }}"
+#       region: "{{ aws_region }}"
+#     register: argocd_raw
+#     no_log: true
+#
+#   - name: Set argocd_admin_password fact
+#     set_fact:
+#       argocd_admin_password: "{{ (argocd_raw.secret | from_json).password }}"
+#     no_log: true
+
+argocd_secret_arn: ""
+app_secret_arn: ""
+helm_repo_secret_arn: ""

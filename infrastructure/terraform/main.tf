@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.8"
+  required_version = "~> 1.10"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -8,9 +8,36 @@ terraform {
   }
 }
 
+locals {
+  common_tags = merge(
+    {
+      Project     = var.project_name
+      Environment = var.environment
+      ManagedBy   = "Terraform"
+    },
+    var.additional_tags
+  )
+}
+
 provider "aws" {
   region = var.aws_region
+
+  # When running in GitHub Actions, credentials arrive via OIDC token exchange
+  # (no long-lived keys). assume_role is optional — set terraform_assume_role_arn
+  # to further scope down the effective permissions.
+  dynamic "assume_role" {
+    for_each = var.terraform_assume_role_arn != "" ? [var.terraform_assume_role_arn] : []
+    content {
+      role_arn = assume_role.value
+    }
+  }
+
+  default_tags {
+    tags = local.common_tags
+  }
 }
+
+# ─── Modules ──────────────────────────────────────────────────────────────────
 
 module "vpc" {
   source       = "./modules/vpc"
@@ -36,10 +63,10 @@ module "opensearch_serverless" {
   environment  = var.environment
 }
 
-# S3 WORM Audit Bucket
+# ─── S3 WORM Audit Bucket ─────────────────────────────────────────────────────
+
 resource "aws_s3_bucket" "worm_audit" {
   bucket = "${var.project_name}-worm-audit-${var.environment}"
-  tags   = { Project = var.project_name, Environment = var.environment }
 }
 
 resource "aws_s3_bucket_object_lock_configuration" "worm" {
@@ -61,7 +88,10 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "worm" {
   }
 }
 
-# DynamoDB Audit Table
+# ─── DynamoDB Audit Log ───────────────────────────────────────────────────────
+# NOTE: this DynamoDB table is for HIPAA audit logging, not for Terraform state
+# locking. State locking now uses S3 native locking (use_lockfile in backend.tf).
+
 resource "aws_dynamodb_table" "audit_log" {
   name         = "${var.project_name}-bedrock-audit-log"
   billing_mode = "PAY_PER_REQUEST"
@@ -79,6 +109,4 @@ resource "aws_dynamodb_table" "audit_log" {
 
   point_in_time_recovery { enabled = true }
   server_side_encryption  { enabled = true }
-
-  tags = { Project = var.project_name, Environment = var.environment }
 }
