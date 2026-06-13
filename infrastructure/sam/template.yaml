@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Healthcare AI Regulatory Platform - Serverless Stack
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  OpenSearchEndpoint:
+    Type: String
+  WormBucketName:
+    Type: String
+  AuditTableName:
+    Type: String
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+        WORM_BUCKET: !Ref WormBucketName
+        AUDIT_TABLE: !Ref AuditTableName
+
+Resources:
+  BedrockValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-bedrock-validator"
+      CodeUri: src/bedrock_validator/
+      Handler: app.lambda_handler
+      Policies:
+        - AmazonBedrockFullAccess
+        - AmazonDynamoDBFullAccess
+        - AmazonOpenSearchServiceFullAccess
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /validate
+            Method: post
+
+  ComplianceAggregatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-compliance-aggregator"
+      CodeUri: src/compliance_aggregator/
+      Handler: app.lambda_handler
+      Policies:
+        - AmazonS3FullAccess
+        - AmazonDynamoDBFullAccess
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /aggregate
+            Method: post
+
+Outputs:
+  BedrockValidatorApi:
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/validate"
+  ComplianceAggregatorApi:
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/aggregate"

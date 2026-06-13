@@ -1,0 +1,21 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enforce-slsa-provenance
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-slsa-attestation
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      verifyImages:
+        - imageReferences: ["*"]
+          attestations:
+            - predicateType: https://slsa.dev/provenance/v1
+              conditions:
+                - all:
+                    - key: "{{ buildDefinition.buildType }}"
+                      operator: Equals
+                      value: "https://github.com/slsa-framework/slsa-github-generator/actions/build@v1"

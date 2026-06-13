@@ -1,0 +1,75 @@
+- name: Deploy EKS add-ons
+  hosts: eks
+  gather_facts: no
+
+  vars_files:
+    - group_vars/all.yml
+
+  tasks:
+    - name: Update kubeconfig for EKS cluster
+      command: >
+        aws eks update-kubeconfig
+        --name {{ eks_cluster_name }}
+        --region {{ aws_region }}
+
+    - name: Add Kyverno Helm repo
+      kubernetes.core.helm_repository:
+        name: kyverno
+        repo_url: https://kyverno.github.io/kyverno/
+
+    - name: Install Kyverno
+      kubernetes.core.helm:
+        name: kyverno
+        chart_ref: kyverno/kyverno
+        release_namespace: kyverno
+        create_namespace: true
+        values:
+          replicaCount: 3
+
+    - name: Add ArgoCD Helm repo
+      kubernetes.core.helm_repository:
+        name: argo
+        repo_url: https://argoproj.github.io/argo-helm
+
+    - name: Install ArgoCD
+      kubernetes.core.helm:
+        name: argocd
+        chart_ref: argo/argo-cd
+        release_namespace: argocd
+        create_namespace: true
+        values:
+          configs:
+            secret:
+              argocdServerAdminPassword: "{{ argocd_admin_password }}"
+
+    - name: Install Secrets Store CSI Driver
+      kubernetes.core.helm:
+        name: secrets-store-csi-driver
+        chart_ref: secrets-store-csi-driver/secrets-store-csi-driver
+        release_namespace: kube-system
+        values:
+          syncSecret:
+            enabled: true
+
+    - name: Install AWS Secrets Manager provider
+      kubernetes.core.helm:
+        name: aws-secrets-manager-provider
+        chart_ref: aws/eks-charts
+        release_namespace: kube-system
+
+    - name: Add Prometheus Helm repo
+      kubernetes.core.helm_repository:
+        name: prometheus-community
+        repo_url: https://prometheus-community.github.io/helm-charts
+
+    - name: Install Prometheus + Grafana stack
+      kubernetes.core.helm:
+        name: kube-prometheus-stack
+        chart_ref: prometheus-community/kube-prometheus-stack
+        release_namespace: monitoring
+        create_namespace: true
+
+    - name: Apply ArgoCD App-of-Apps
+      kubernetes.core.k8s:
+        src: "{{ playbook_dir }}/../../kubernetes/argocd/app-of-apps.yaml"
+        state: present

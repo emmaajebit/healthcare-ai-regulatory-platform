@@ -1,0 +1,8 @@
+# This file should be encrypted with ansible-vault:
+# ansible-vault encrypt ansible/playbooks/group_vars/all.yml
+#
+# Encrypt with: ansible-vault encrypt ansible/playbooks/group_vars/all.yml
+# Edit with:    ansible-vault edit ansible/playbooks/group_vars/all.yml
+
+argocd_admin_password: "CHANGE_ME_ENCRYPT_WITH_VAULT"
+helm_repo_token: "CHANGE_ME_ENCRYPT_WITH_VAULT"

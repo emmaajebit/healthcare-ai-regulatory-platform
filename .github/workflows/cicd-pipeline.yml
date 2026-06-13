@@ -1,0 +1,111 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # Stage 1: Build
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t ${{ secrets.ECR_REGISTRY }}/java-healthcare-app:${{ github.sha }} .
+
+  # Stage 2: RAG AI Validation
+  rag-ai-validation:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Invoke Bedrock Validator Lambda
+        run: |
+          aws lambda invoke \
+            --function-name bedrock-validator \
+            --payload '{"commit": "${{ github.sha }}"}' \
+            response.json
+          cat response.json
+
+  # Stage 3: Trivy Security Scan
+  trivy-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ secrets.ECR_REGISTRY }}/java-healthcare-app:${{ github.sha }}
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+  # Stage 4: Checkov IaC Scan
+  checkov-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infrastructure/terraform
+
+  # Stage 5: SLSA Provenance Generation
+  slsa-provenance:
+    needs: [trivy-scan, checkov-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v1.9.0
+        with:
+          image: ${{ secrets.ECR_REGISTRY }}/java-healthcare-app
+          digest: ${{ github.sha }}
+
+  # Stage 6: Cosign Image Signing
+  cosign-sign:
+    needs: slsa-provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sign image with Cosign
+        run: |
+          cosign sign --key env://COSIGN_PRIVATE_KEY \
+            ${{ secrets.ECR_REGISTRY }}/java-healthcare-app:${{ github.sha }}
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+
+  # Stage 7: Push to ECR
+  push-ecr:
+    needs: cosign-sign
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push to ECR
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
+          docker push ${{ secrets.ECR_REGISTRY }}/java-healthcare-app:${{ github.sha }}
+
+  # Stage 8: ArgoCD Sync
+  argocd-deploy:
+    needs: push-ecr
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger ArgoCD sync
+        run: |
+          argocd app sync java-healthcare-app \
+            --auth-token ${{ secrets.ARGOCD_TOKEN }} \
+            --server ${{ secrets.ARGOCD_SERVER }}
+
+  # Stage 9: k6 Load Test
+  load-test:
+    needs: argocd-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run k6 load test
+        run: k6 run scripts/load-test.js
+
+  # Stage 10: WORM Compliance Report
+  worm-report:
+    needs: load-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate and store WORM report
+        run: bash scripts/generate-audit-proof.sh

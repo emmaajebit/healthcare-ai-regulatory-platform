@@ -1,0 +1,16 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enforce-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: verify-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      verifyImages:
+        - imageReferences: ["*"]
+          keys:
+            - kms: "awskms:///alias/cosign-signing-key"

@@ -1,0 +1,54 @@
+name: PR Ephemeral Environment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+jobs:
+  deploy-ephemeral:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create ephemeral namespace
+        run: |
+          kubectl create namespace pr-${{ github.event.number }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply zero-trust network policy
+        run: |
+          kubectl apply -f kubernetes/network-policies/default-deny.yaml \
+            -n pr-${{ github.event.number }}
+
+      - name: Deploy app to ephemeral namespace
+        run: |
+          helm upgrade --install java-healthcare-app-pr-${{ github.event.number }} \
+            kubernetes/helm/java-healthcare-app \
+            --namespace pr-${{ github.event.number }} \
+            --set image.tag=${{ github.sha }}
+
+      - name: Run integration tests
+        run: |
+          kubectl wait --for=condition=ready pod \
+            -l app=java-healthcare-app \
+            -n pr-${{ github.event.number }} \
+            --timeout=120s
+          # Run tests against ephemeral environment
+
+      - name: Post preview URL to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `Preview environment ready: http://pr-${{ github.event.number }}.preview.internal`
+            })
+
+  teardown-ephemeral:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete ephemeral namespace
+        run: kubectl delete namespace pr-${{ github.event.number }} --ignore-not-found

@@ -1,0 +1,31 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
+
+# Secrets & Keys
+cosign.key
+*.pem
+*.p12
+.vault_password
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+
+# Logs & reports
+*.log
+reports/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
