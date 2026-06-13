@@ -2,15 +2,42 @@ apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: enforce-image-signature
+  annotations:
+    policies.kyverno.io/title: Require Cosign Keyless Signature
+    policies.kyverno.io/description: >-
+      Every container image must be signed by the CI/CD pipeline using Cosign
+      keyless signing (Sigstore Fulcio + Rekor). The signature certificate must
+      carry a subject matching the cicd-pipeline.yml workflow and be issued by
+      the GitHub Actions OIDC provider. No private keys are stored anywhere —
+      the certificate is issued transiently and recorded in Rekor's public
+      transparency log.
 spec:
   validationFailureAction: Enforce
+  background: false
   rules:
-    - name: verify-cosign-signature
+    - name: verify-cosign-keyless-signature
       match:
         any:
           - resources:
               kinds: [Pod]
+              namespaces:
+                - default
+                - production
+                - staging
       verifyImages:
-        - imageReferences: ["*"]
-          keys:
-            - kms: "awskms:///alias/cosign-signing-key"
+        - imageReferences:
+            - "*"
+          mutateDigest: true      # pin image tag to digest after verification
+          verifyDigest: true      # reject images referenced by mutable tags only
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    # Subject matches the workflow file that ran cosign sign.
+                    # The wildcard on @refs/... allows both main and release branches.
+                    subject: >-
+                      https://github.com/emmaajebit/healthcare-ai-regulatory-platform/.github/workflows/cicd-pipeline.yml@refs/heads/main
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev

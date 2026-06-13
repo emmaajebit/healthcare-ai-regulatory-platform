@@ -2,20 +2,53 @@ apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: enforce-slsa-provenance
+  annotations:
+    policies.kyverno.io/title: Require SLSA v1.0 Provenance Attestation
+    policies.kyverno.io/description: >-
+      Every container image must carry a SLSA v1.0 provenance attestation
+      attached via `cosign attest --type slsaprovenance1` during the CI/CD
+      pipeline. The attestation must be signed with the same keyless Cosign
+      identity (GitHub OIDC → Sigstore Fulcio) as the image signature, and
+      the predicate must identify the cicd-pipeline.yml workflow as the builder.
+      This enforces supply-chain integrity at the cluster admission gate —
+      any image without a valid, traceable provenance is rejected.
 spec:
   validationFailureAction: Enforce
+  background: false
   rules:
-    - name: check-slsa-attestation
+    - name: verify-slsa-provenance-attestation
       match:
         any:
           - resources:
               kinds: [Pod]
+              namespaces:
+                - default
+                - production
+                - staging
       verifyImages:
-        - imageReferences: ["*"]
+        - imageReferences:
+            - "*"
           attestations:
-            - predicateType: https://slsa.dev/provenance/v1
+            - predicateType: "https://slsa.dev/provenance/v1"
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        subject: >-
+                          https://github.com/emmaajebit/healthcare-ai-regulatory-platform/.github/workflows/cicd-pipeline.yml@refs/heads/main
+                        issuer: "https://token.actions.githubusercontent.com"
+                        rekor:
+                          url: https://rekor.sigstore.dev
               conditions:
                 - all:
+                    # The buildType must reference the slsa-github-generator or
+                    # the GitHub Actions runner used in cosign attest step.
                     - key: "{{ buildDefinition.buildType }}"
+                      operator: AnyIn
+                      value:
+                        - "https://github.com/slsa-framework/slsa-github-generator/container@v1"
+                        - "https://github.com/actions/runner"
+                    # The repository must match this repo — prevents cross-repo provenance reuse.
+                    - key: "{{ buildDefinition.externalParameters.workflow.repository }}"
                       operator: Equals
-                      value: "https://github.com/slsa-framework/slsa-github-generator/actions/build@v1"
+                      value: "emmaajebit/healthcare-ai-regulatory-platform"

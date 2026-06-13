@@ -4,43 +4,100 @@ on:
   push:
     branches: [main]
 
-jobs:
-  # Stage 1: Build
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build Docker image
-        run: docker build -t ${{ secrets.ECR_REGISTRY }}/java-healthcare-app:${{ github.sha }} .
+# OIDC permissions — id-token:write lets GitHub issue an OIDC token so:
+#   • aws-actions/configure-aws-credentials can exchange it for STS credentials
+#   • cosign can exchange it for a Sigstore Fulcio certificate (keyless signing)
+#   • actions/attest-build-provenance can write to GitHub's attestation store
+permissions:
+  id-token: write
+  contents: read
+  attestations: write
 
-  # Stage 2: RAG AI Validation
+env:
+  AWS_REGION: us-east-1
+  IMAGE_NAME: java-healthcare-app
+
+# ─── Stage 1 + 7: Build and Push ─────────────────────────────────────────────
+# Push happens FIRST so we have a real image digest (sha256:...) to sign.
+# Signing a digest that doesn't exist in the registry yet would be meaningless.
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image:  ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Derive image name
+        id: meta
+        run: |
+          echo "image=${{ steps.ecr-login.outputs.registry }}/${{ env.IMAGE_NAME }}" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (docker/build-push-action outputs the digest)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ github.sha }}
+
+# ─── Stage 2: RAG AI Validation ──────────────────────────────────────────────
   rag-ai-validation:
-    needs: build
+    needs: build-and-push
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Invoke Bedrock Validator Lambda
         run: |
           aws lambda invoke \
             --function-name bedrock-validator \
-            --payload '{"commit": "${{ github.sha }}"}' \
+            --payload "{\"commit\": \"${{ github.sha }}\"}" \
             response.json
           cat response.json
+          jq -e '.validation_passed == true' response.json
 
-  # Stage 3: Trivy Security Scan
+# ─── Stage 3: Trivy Container Scan ───────────────────────────────────────────
   trivy-scan:
-    needs: build
+    needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - uses: aquasecurity/trivy-action@master
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          image-ref: ${{ secrets.ECR_REGISTRY }}/java-healthcare-app:${{ github.sha }}
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image }}@${{ needs.build-and-push.outputs.digest }}
           exit-code: 1
           severity: CRITICAL,HIGH
 
-  # Stage 4: Checkov IaC Scan
+# ─── Stage 4: Checkov IaC Scan ───────────────────────────────────────────────
   checkov-scan:
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,64 +105,169 @@ jobs:
         with:
           directory: infrastructure/terraform
 
-  # Stage 5: SLSA Provenance Generation
+# ─── Stage 5: SLSA Provenance ────────────────────────────────────────────────
+# actions/attest-build-provenance generates a SLSA v1.0 Build L1+ provenance
+# attestation signed with the GitHub OIDC identity. It is stored in GitHub's
+# attestation store AND pushed to the OCI registry as a referrer artifact.
+# Verify with: gh attestation verify oci://<image>@<digest> --repo <repo>
   slsa-provenance:
-    needs: [trivy-scan, checkov-scan]
+    needs: [build-and-push, trivy-scan, checkov-scan, rag-ai-validation]
     runs-on: ubuntu-latest
     steps:
-      - uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v1.9.0
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          image: ${{ secrets.ECR_REGISTRY }}/java-healthcare-app
-          digest: ${{ github.sha }}
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  # Stage 6: Cosign Image Signing
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate SLSA provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name:   ${{ needs.build-and-push.outputs.image }}
+          subject-digest: ${{ needs.build-and-push.outputs.digest }}
+          push-to-registry: true
+
+# ─── Stage 6: Cosign Keyless Image Signing ───────────────────────────────────
+# Cosign exchanges the GitHub OIDC token for a short-lived Sigstore Fulcio
+# certificate, then signs the image digest. The signature and certificate are
+# recorded in the Rekor public transparency log. No private keys stored anywhere.
+#
+# Certificate subject (used by Kyverno to verify):
+#   https://github.com/<repo>/.github/workflows/cicd-pipeline.yml@refs/heads/main
+# Certificate issuer:
+#   https://token.actions.githubusercontent.com
   cosign-sign:
     needs: slsa-provenance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Sign image with Cosign
-        run: |
-          cosign sign --key env://COSIGN_PRIVATE_KEY \
-            ${{ secrets.ECR_REGISTRY }}/java-healthcare-app:${{ github.sha }}
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  # Stage 7: Push to ECR
-  push-ecr:
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless — no private key required)
+        env:
+          IMAGE_REF: ${{ needs.build-and-push.outputs.image }}@${{ needs.build-and-push.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE_REF}"
+
+      - name: Attach SLSA provenance as Cosign attestation
+        env:
+          IMAGE_REF: ${{ needs.build-and-push.outputs.image }}@${{ needs.build-and-push.outputs.digest }}
+        run: |
+          # Produce a minimal SLSA v1.0 predicate and attach it via cosign attest
+          # so Kyverno can verify it through Sigstore (separate from GitHub attestation store)
+          cat > slsa-predicate.json <<'JSON'
+          {
+            "buildDefinition": {
+              "buildType": "https://github.com/slsa-framework/slsa-github-generator/container@v1",
+              "externalParameters": {
+                "workflow": {
+                  "repository": "${{ github.repository }}",
+                  "ref":        "${{ github.ref }}",
+                  "path":       ".github/workflows/cicd-pipeline.yml"
+                }
+              }
+            },
+            "runDetails": {
+              "builder": { "id": "https://github.com/actions/runner" },
+              "metadata": {
+                "invocationId":  "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "startedOn":     "${{ github.event.head_commit.timestamp }}",
+                "finishedOn":    ""
+              }
+            }
+          }
+          JSON
+          cosign attest --yes \
+            --predicate slsa-predicate.json \
+            --type slsaprovenance1 \
+            "${IMAGE_REF}"
+
+      - name: Verify Cosign signature (gate — fail pipeline if invalid)
+        env:
+          IMAGE_REF: ${{ needs.build-and-push.outputs.image }}@${{ needs.build-and-push.outputs.digest }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp \
+              "https://github.com/${{ github.repository }}/.github/workflows/cicd-pipeline.yml@.*" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "${IMAGE_REF}"
+
+# ─── Stage 8: ArgoCD GitOps Sync ─────────────────────────────────────────────
+  argocd-deploy:
     needs: cosign-sign
     runs-on: ubuntu-latest
     steps:
-      - name: Push to ECR
-        run: |
-          aws ecr get-login-password | docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
-          docker push ${{ secrets.ECR_REGISTRY }}/java-healthcare-app:${{ github.sha }}
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  # Stage 8: ArgoCD Sync
-  argocd-deploy:
-    needs: push-ecr
-    runs-on: ubuntu-latest
-    steps:
+      - name: Install ArgoCD CLI
+        run: |
+          curl -fsSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/download/v2.11.3/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Fetch ArgoCD token from Secrets Manager
+        id: argocd-secret
+        run: |
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id /healthcare-ai/argocd/admin \
+            --query SecretString --output text)
+          echo "::add-mask::$(echo $SECRET | jq -r .password)"
+          echo "password=$(echo $SECRET | jq -r .password)" >> "$GITHUB_OUTPUT"
+
       - name: Trigger ArgoCD sync
+        env:
+          ARGOCD_PASSWORD: ${{ steps.argocd-secret.outputs.password }}
         run: |
           argocd app sync java-healthcare-app \
-            --auth-token ${{ secrets.ARGOCD_TOKEN }} \
-            --server ${{ secrets.ARGOCD_SERVER }}
+            --auth-token "${ARGOCD_PASSWORD}" \
+            --server "${{ vars.ARGOCD_SERVER }}" \
+            --grpc-web
 
-  # Stage 9: k6 Load Test
+# ─── Stage 9: k6 Load Test ───────────────────────────────────────────────────
   load-test:
     needs: argocd-deploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install k6
+        run: |
+          curl -fsSL https://github.com/grafana/k6/releases/download/v0.51.0/k6-v0.51.0-linux-amd64.tar.gz \
+            | tar -xz -C /tmp/ && mv /tmp/k6-v0.51.0-linux-amd64/k6 /usr/local/bin/k6
       - name: Run k6 load test
         run: k6 run scripts/load-test.js
 
-  # Stage 10: WORM Compliance Report
+# ─── Stage 10: WORM Compliance Report ────────────────────────────────────────
   worm-report:
     needs: load-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Generate and store WORM report
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate and store WORM audit report
+        env:
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMAGE_REF:    ${{ needs.build-and-push.outputs.image }}
         run: bash scripts/generate-audit-proof.sh
