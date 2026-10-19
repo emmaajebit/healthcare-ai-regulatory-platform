@@ -1,0 +1,29 @@
+# ArgoCD Application for the demo service.
+# The image.repository placeholder is replaced with the real ECR URL by
+# scripts/bootstrap-aws.sh after the first terraform apply.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: java-healthcare-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/emmaajebit/healthcare-ai-regulatory-platform
+    targetRevision: main
+    path: kubernetes/helm/java-healthcare-app
+    helm:
+      parameters:
+        - name: image.repository
+          value: REPLACE_ECR_REGISTRY/healthcare-ai/java-healthcare-app
+        - name: image.tag
+          value: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: healthcare
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -40,16 +40,18 @@ provider "aws" {
 # ─── Modules ──────────────────────────────────────────────────────────────────
 
 module "vpc" {
-  source       = "./modules/vpc"
-  project_name = var.project_name
-  environment  = var.environment
+  source          = "./modules/vpc"
+  project_name    = var.project_name
+  environment     = var.environment
+  log_kms_key_arn = aws_kms_key.secrets.arn
 }
 
 module "eks" {
-  source       = "./modules/eks"
-  project_name = var.project_name
-  vpc_id       = module.vpc.vpc_id
-  subnet_ids   = module.vpc.private_subnet_ids
+  source              = "./modules/eks"
+  project_name        = var.project_name
+  vpc_id              = module.vpc.vpc_id
+  subnet_ids          = module.vpc.private_subnet_ids
+  secrets_kms_key_arn = aws_kms_key.secrets.arn
 }
 
 module "ecr" {
@@ -67,6 +69,42 @@ module "opensearch_serverless" {
 
 resource "aws_s3_bucket" "worm_audit" {
   bucket = "${var.project_name}-worm-audit-${var.environment}"
+
+  # Object Lock requires versioning enabled from creation (CKV_AWS_21).
+  object_lock_enabled = true
+}
+
+resource "aws_s3_bucket_versioning" "worm" {
+  bucket = aws_s3_bucket.worm_audit.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# CKV2_AWS_6: block all public access on the audit bucket.
+resource "aws_s3_bucket_public_access_block" "worm" {
+  bucket                  = aws_s3_bucket.worm_audit.id
+  block_public_acls       = true
+  ignore_public_acls      = true
+  block_public_policy     = true
+  restrict_public_buckets = true
+}
+
+# CKV2_AWS_61: lifecycle — noncurrent versions expire only after the full
+# WORM retention period (Object Lock COMPLIANCE prevents earlier deletion).
+resource "aws_s3_bucket_lifecycle_configuration" "worm" {
+  bucket = aws_s3_bucket.worm_audit.id
+  rule {
+    id     = "expire-noncurrent-after-retention"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+    noncurrent_version_expiration {
+      noncurrent_days = var.worm_retention_days
+    }
+  }
 }
 
 resource "aws_s3_bucket_object_lock_configuration" "worm" {
@@ -108,5 +146,10 @@ resource "aws_dynamodb_table" "audit_log" {
   }
 
   point_in_time_recovery { enabled = true }
-  server_side_encryption  { enabled = true }
+
+  # CKV_AWS_119: encrypt the audit table with the platform CMK.
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = aws_kms_key.secrets.arn
+  }
 }

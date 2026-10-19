@@ -100,6 +100,34 @@ Developer Push
 
 ## Quick Start
 
+### Demo in one command
+
+The fastest path for a demo — bootstraps AWS, applies Terraform, and wires up
+GitHub Actions keyless auth in one shot (requires admin AWS credentials locally):
+
+```bash
+bash scripts/bootstrap-aws.sh            # + optional: ARGOCD_SERVER=argocd.example:443 SEED_ARGOCD_PASSWORD=1
+make serverless                          # Bedrock validator + compliance aggregator Lambdas
+bash scripts/terraform-to-ansible.sh    # sync outputs → Ansible inventory
+make k8s                                 # Kyverno, ArgoCD, Secrets Store CSI, Prometheus
+```
+
+After that, every push to `main` runs the full 10-stage keyless pipeline
+(build → RAG validation → Trivy → Checkov → SLSA → Cosign → ArgoCD → k6 → WORM report),
+and every infrastructure change runs fmt/validate/plan/apply through the
+`Terraform` workflow's OIDC roles.
+
+Until the one-time bootstrap runs (and sets the `AWS_*` repository variables),
+the AWS-dependent pipeline stages are **skipped, not failed** — credential-free
+checks (fmt, validate, Checkov) still run green on every push.
+
+> PoC tradeoffs, documented inline in the code: the EKS API endpoint is public
+> so GitHub-hosted runners can reach it (use a VPC-attached runner for
+> production), the deployer role has AdministratorAccess, and a handful of
+> Checkov checks are skipped in `infrastructure/terraform/.checkov.yml`.
+> The WORM bucket's Object Lock compliance retention also prevents deleting
+> the audit objects before `worm_retention_days` — plan cleanup accordingly.
+
 ### Step 1 — Clone and bootstrap the toolchain
 
 ```bash

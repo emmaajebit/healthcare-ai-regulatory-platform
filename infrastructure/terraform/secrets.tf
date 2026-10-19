@@ -10,6 +10,43 @@ resource "aws_kms_key" "secrets" {
   deletion_window_in_days = 14
   enable_key_rotation     = true
   tags                    = merge(local.common_tags, { Name = "${var.project_name}-secrets-kms" })
+
+  # CKV2_AWS_64: explicit key policy — the account root retains full control
+  # and access is delegated through IAM policies (e.g. EKS secrets encryption).
+  # Service principals below need direct key access (IAM does not apply to them):
+  #   - CloudWatch Logs encrypts the VPC flow-log group
+  #   - EKS uses grants for Kubernetes secrets envelope encryption
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "EnableIAMUserPermissions"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${var.aws_account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "AllowCloudWatchLogs"
+        Effect    = "Allow"
+        Principal = { Service = "logs.${var.aws_region}.amazonaws.com" }
+        Action    = ["kms:GenerateDataKey*", "kms:Decrypt"]
+        Resource  = "*"
+        Condition = {
+          ArnEquals = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/vpc/${var.project_name}-flow-logs"
+          }
+        }
+      },
+      {
+        Sid       = "AllowEKSSecretsEncryption"
+        Effect    = "Allow"
+        Principal = { Service = "eks.${var.aws_region}.amazonaws.com" }
+        Action    = ["kms:CreateGrant", "kms:ListGrants", "kms:RevokeGrant", "kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*"]
+        Resource  = "*"
+      }
+    ]
+  })
 }
 
 resource "aws_kms_alias" "secrets" {
@@ -106,9 +143,9 @@ resource "aws_iam_policy" "secrets_reader" {
         ]
       },
       {
-        Sid    = "KMSDecrypt"
-        Effect = "Allow"
-        Action = ["kms:Decrypt", "kms:DescribeKey"]
+        Sid      = "KMSDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:DescribeKey"]
         Resource = [aws_kms_key.secrets.arn]
       },
     ]

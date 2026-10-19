@@ -1,0 +1,11 @@
+# PoC-scoped Checkov policy.
+# These checks are intentionally skipped for the proof-of-concept deployment —
+# remove them before any production use.
+skip-check:
+  - CKV2_AWS_57  # Secrets Manager auto-rotation: requires Lambda rotators per secret
+  - CKV2_AWS_19  # EIP attachment: false positive — EIPs are attached to the NAT gateways
+  - CKV_AWS_18   # S3 bucket access logging: needs a dedicated log bucket (PoC)
+  - CKV_AWS_144  # S3 cross-region replication: PoC
+  - CKV2_AWS_62  # S3 event notifications: PoC
+  - CKV_AWS_355  # Deployer policy wildcard resource: by design — deployer role needs broad EKS/S3 state write
+  - CKV_AWS_290  # Deployer policy unconstrained write: by design — see oidc.tf
