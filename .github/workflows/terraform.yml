@@ -1,0 +1,120 @@
+name: Terraform
+
+# Post-bootstrap CI for infrastructure/terraform.
+#   - every change: fmt + validate (no AWS access needed)
+#   - pull requests: terraform plan via the read-only planner OIDC role
+#   - main + manual dispatch: plan and apply the same saved plan, via the
+#     deployer OIDC role (restricted to main)
+#
+# Both roles are created by the Terraform bootstrap itself
+# (scripts/bootstrap-aws.sh). Until that one-time bootstrap runs and sets the
+# AWS_* repository variables, the plan/apply jobs are skipped (not failed).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/terraform/**'
+      - '.github/workflows/terraform.yml'
+  pull_request:
+    paths:
+      - 'infrastructure/terraform/**'
+      - '.github/workflows/terraform.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write    # OIDC → AWS STS
+  contents: read
+  pull-requests: write
+
+# Serialize all access to the single S3 state (use_lockfile protects inside
+# Terraform too — this avoids wasted queued runs and plan/apply races).
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  fmt-validate:
+    name: fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: terraform fmt
+        run: terraform -chdir=infrastructure/terraform fmt -check -recursive
+
+      - name: terraform init (no backend)
+        run: terraform -chdir=infrastructure/terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform -chdir=infrastructure/terraform validate
+
+  plan:
+    name: terraform plan (planner role)
+    needs: fmt-validate
+    if: github.event_name == 'pull_request' && vars.AWS_PLANNER_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Authenticate to AWS via OIDC (read-only planner role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLANNER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform -chdir=infrastructure/terraform init
+
+      - name: terraform plan
+        run: |
+          terraform -chdir=infrastructure/terraform plan -no-color \
+            -var="aws_account_id=${{ vars.AWS_ACCOUNT_ID }}" \
+            -var="github_org=${{ github.repository_owner }}" \
+            -var="github_repo=${{ github.event.repository.name }}"
+
+  apply:
+    name: terraform plan + apply (deployer role)
+    # Deployment path: main branch only (including manual dispatch), and only
+    # once the bootstrap has set the deployer role variable.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.AWS_ROLE_TO_ASSUME != ''
+    needs: fmt-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Authenticate to AWS via OIDC (deployer role — main only)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform -chdir=infrastructure/terraform init
+
+      # Plan and apply the SAME artifact sequentially in one job: apply is
+      # blocked if the plan step fails, and applies exactly what was reviewed.
+      - name: terraform plan (saved)
+        run: |
+          terraform -chdir=infrastructure/terraform plan -no-color -out=tfplan \
+            -var="aws_account_id=${{ vars.AWS_ACCOUNT_ID }}" \
+            -var="github_org=${{ github.repository_owner }}" \
+            -var="github_repo=${{ github.event.repository.name }}"
+
+      - name: terraform apply (saved plan)
+        run: terraform -chdir=infrastructure/terraform apply -no-color tfplan

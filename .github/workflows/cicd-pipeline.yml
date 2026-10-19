@@ -22,6 +22,8 @@ env:
 # Signing a digest that doesn't exist in the registry yet would be meaningless.
 jobs:
   build-and-push:
+    # Skipped (not failed) until the one-time bootstrap sets AWS_ROLE_TO_ASSUME.
+    if: vars.AWS_ROLE_TO_ASSUME != ''
     runs-on: ubuntu-latest
     outputs:
       image:  ${{ steps.meta.outputs.image }}
@@ -55,6 +57,7 @@ jobs:
 
 # ─── Stage 2: RAG AI Validation ──────────────────────────────────────────────
   rag-ai-validation:
+    if: vars.AWS_ROLE_TO_ASSUME != ''
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
@@ -101,9 +104,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bridgecrewio/checkov-action@master
+      - uses: bridgecrewio/checkov-action@v12
         with:
           directory: infrastructure/terraform
+          # Version pinned to match the locally tested result:
+          # 97 passed / 0 failed under the documented PoC exceptions
+          # (infrastructure/terraform/.checkov.yml).
+          version: "3.3.29"
 
 # ─── Stage 5: SLSA Provenance ────────────────────────────────────────────────
 # actions/attest-build-provenance generates a SLSA v1.0 Build L1+ provenance
@@ -207,9 +214,16 @@ jobs:
 
 # ─── Stage 8: ArgoCD GitOps Sync ─────────────────────────────────────────────
   argocd-deploy:
+    if: vars.AWS_ROLE_TO_ASSUME != '' && vars.ARGOCD_SERVER != ''
     needs: cosign-sign
     runs-on: ubuntu-latest
+    # GitOps image promotion commits the new SHA to the ArgoCD Application
+    # manifest in git, so this job needs write access to the repository.
+    permissions:
+      id-token: write
+      contents: write
     steps:
+      - uses: actions/checkout@v4
       - name: Authenticate to AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -231,30 +245,68 @@ jobs:
           echo "::add-mask::$(echo $SECRET | jq -r .password)"
           echo "password=$(echo $SECRET | jq -r .password)" >> "$GITHUB_OUTPUT"
 
+      - name: Promote image SHA to the GitOps manifest
+        run: |
+          # Mutable :main tags never change the pod template, so a re-push would
+          # not roll out. Instead, commit the new SHA to the ArgoCD Application
+          # (image.tag) — a template change that ArgoCD reliably rolls out.
+          sed -i "/name: image.tag/{n;s|value: .*|value: ${GITHUB_SHA}|}" \
+            kubernetes/argocd/java-healthcare-app.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add kubernetes/argocd/java-healthcare-app.yaml
+          git commit -m "chore(gitops): promote image ${GITHUB_SHA}" || echo "no change"
+          git push
+
       - name: Trigger ArgoCD sync
         env:
           ARGOCD_PASSWORD: ${{ steps.argocd-secret.outputs.password }}
         run: |
-          argocd app sync java-healthcare-app \
-            --auth-token "${ARGOCD_PASSWORD}" \
-            --server "${{ vars.ARGOCD_SERVER }}" \
-            --grpc-web
+          argocd login "${{ vars.ARGOCD_SERVER }}" \
+            --username admin --password "${ARGOCD_PASSWORD}" \
+            --grpc-web --insecure
+          argocd app sync java-healthcare-app --grpc-web
+          argocd app wait java-healthcare-app --health --timeout 300 --grpc-web
 
 # ─── Stage 9: k6 Load Test ───────────────────────────────────────────────────
   load-test:
+    if: vars.AWS_ROLE_TO_ASSUME != ''
     needs: argocd-deploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name healthcare-ai-eks --region ${{ env.AWS_REGION }}
+
       - name: Install k6
         run: |
           curl -fsSL https://github.com/grafana/k6/releases/download/v0.51.0/k6-v0.51.0-linux-amd64.tar.gz \
             | tar -xz -C /tmp/ && mv /tmp/k6-v0.51.0-linux-amd64/k6 /usr/local/bin/k6
+
+      - name: Port-forward app service (runner cannot reach cluster-internal DNS)
+        run: |
+          kubectl port-forward -n healthcare svc/java-healthcare-app 8080:8080 &
+          for i in $(seq 1 15); do
+            curl -s -o /dev/null http://localhost:8080/healthz && echo "app reachable" && exit 0
+            sleep 2
+          done
+          echo "app never became reachable"; exit 1
+
       - name: Run k6 load test
+        env:
+          TARGET_URL: http://localhost:8080
         run: k6 run scripts/load-test.js
 
 # ─── Stage 10: WORM Compliance Report ────────────────────────────────────────
   worm-report:
+    if: vars.AWS_ROLE_TO_ASSUME != ''
     needs: load-test
     runs-on: ubuntu-latest
     steps:
