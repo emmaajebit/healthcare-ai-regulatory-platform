@@ -224,6 +224,7 @@ terraform output terraform_deployer_role_arn
 |----------|-------|
 | `AWS_ROLE_TO_ASSUME` | ARN from `terraform output terraform_deployer_role_arn` |
 | `ARGOCD_SERVER` | Your ArgoCD server URL (e.g. `argocd.internal:443`) |
+| `ENABLE_PR_PREVIEWS` / `PR_PREVIEW_ROLE_ARN` | *(optional)* turn on per-PR ephemeral namespaces; the role must trust `pull_request` OIDC tokens |
 | `DEPLOY_RUNNER` | *(optional)* label of a self-hosted runner inside the VPC for the ArgoCD + k6 jobs (needed with a private EKS endpoint) |
 
 > **No `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or `COSIGN_PRIVATE_KEY` needed.**
@@ -256,6 +257,7 @@ make secrets        # = bash scripts/populate-secrets.sh
 # ArgoCD : random password + precomputed bcrypt hash (password_bcrypt)
 # Grafana: its own random password (never shared with ArgoCD)
 # App    : random JWT key; Bedrock/OpenAI keys prompted silently
+# Git    : read-only GitHub PAT so ArgoCD can pull the repo while it's private
 # Values go through a 0600 temp file — nothing in argv or shell history.
 ```
 

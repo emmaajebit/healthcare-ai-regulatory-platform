@@ -126,6 +126,28 @@ resource "aws_secretsmanager_secret_version" "grafana" {
   }
 }
 
+# ── ArgoCD Git Credentials (private GitHub repo) ─────────────────────────────
+
+resource "aws_secretsmanager_secret" "argocd_git" {
+  name                    = var.argocd_git_secret_path
+  kms_key_id              = aws_kms_key.secrets.arn
+  recovery_window_in_days = var.secrets_recovery_window_days
+  description             = "Read-only GitHub token for ArgoCD to pull the private repo"
+  tags                    = merge(local.common_tags, { SecretType = "argocd-git" })
+}
+
+resource "aws_secretsmanager_secret_version" "argocd_git" {
+  secret_id = aws_secretsmanager_secret.argocd_git.id
+  secret_string = jsonencode({
+    username = "git"
+    token    = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
+  })
+
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
+}
+
 # ── Helm Repository Token ─────────────────────────────────────────────────────
 
 resource "aws_secretsmanager_secret" "helm_repo" {

@@ -130,7 +130,11 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Generate SLSA provenance attestation
+      # GitHub's attestation store works only for public repos on Free/Pro/Team
+      # (private needs Enterprise Cloud). The Cosign SLSA attestation in the next
+      # job is what Kyverno verifies, so provenance is still enforced when private.
+      - name: Generate SLSA provenance attestation (GitHub store)
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v1
         with:
           subject-name:   ${{ needs.build-and-push.outputs.image }}

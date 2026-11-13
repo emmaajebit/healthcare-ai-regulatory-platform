@@ -47,6 +47,8 @@
 
     argocd_secret_id: "{{ (argocd_secret_arn | default('')) or '/healthcare-ai/argocd/admin' }}"
     grafana_secret_id: "{{ (grafana_secret_arn | default('')) or '/healthcare-ai/grafana/admin' }}"
+    argocd_git_secret_id: "{{ (argocd_git_secret_arn | default('')) or '/healthcare-ai/argocd/git-repo' }}"
+    git_repo_url: https://github.com/emmaajebit/healthcare-ai-regulatory-platform
 
     kyverno_policy_files:
       - "{{ playbook_dir }}/../../kubernetes/kyverno/policies/enforce-image-signature.yaml"
@@ -100,6 +102,11 @@
     - name: Read Grafana admin secret from Secrets Manager
       ansible.builtin.set_fact:
         grafana_secret: "{{ lookup('amazon.aws.secretsmanager_secret', grafana_secret_id, region=aws_region) | from_json }}"
+      no_log: true
+
+    - name: Read ArgoCD Git credentials (private repo)
+      ansible.builtin.set_fact:
+        argocd_git_secret: "{{ lookup('amazon.aws.secretsmanager_secret', argocd_git_secret_id, region=aws_region, on_missing='skip', on_denied='error') | default('{}', true) | from_json }}"
       no_log: true
 
     - name: Refuse placeholder or empty secrets
@@ -244,6 +251,28 @@
           status: "True"
         wait_timeout: 300
       when: not ansible_check_mode   # nothing is installed in --check
+
+    - name: Register the private Git repo with ArgoCD
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: repo-healthcare-ai-platform
+            namespace: "{{ argocd_namespace }}"
+            labels:
+              argocd.argoproj.io/secret-type: repository
+          type: Opaque
+          stringData:
+            type: git
+            url: "{{ git_repo_url }}"
+            username: "{{ argocd_git_secret.username | default('git') }}"
+            password: "{{ argocd_git_secret.token }}"
+      when:
+        - argocd_git_secret.token is defined
+        - "'REPLACE_VIA' not in argocd_git_secret.token"
+      no_log: true
 
     # ------------------------------------------------------------------
     # 6. Secrets Store CSI Driver + AWS provider

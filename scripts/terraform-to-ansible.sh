@@ -53,6 +53,7 @@ ARGOCD_SECRET_ARN="$(extract argocd_secret_arn)"
 APP_SECRET_ARN="$(extract app_secret_arn)"
 HELM_SECRET_ARN="$(extract helm_repo_secret_arn)"
 GRAFANA_SECRET_ARN="$(extract grafana_secret_arn)"
+ARGOCD_GIT_SECRET_ARN="$(extract argocd_git_secret_arn)"
 SECRETS_READER_POLICY="$(extract secrets_reader_policy_arn)"
 
 log "EKS cluster : ${EKS_CLUSTER_NAME}"
@@ -142,6 +143,7 @@ argocd_secret_arn: "${ARGOCD_SECRET_ARN}"
 app_secret_arn: "${APP_SECRET_ARN}"
 helm_repo_secret_arn: "${HELM_SECRET_ARN}"
 grafana_secret_arn: "${GRAFANA_SECRET_ARN}"
+argocd_git_secret_arn: "${ARGOCD_GIT_SECRET_ARN}"
 
 # ── Fetch secret values in a playbook task like this: ─────────────────────────
 # - name: Fetch ArgoCD secret from Secrets Manager

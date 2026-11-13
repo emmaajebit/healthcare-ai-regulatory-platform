@@ -196,6 +196,12 @@ variable "grafana_secret_path" {
   default     = "/healthcare-ai/grafana/admin"
 }
 
+variable "argocd_git_secret_path" {
+  description = "Secrets Manager path for the read-only GitHub token ArgoCD uses to pull this (private) repo"
+  type        = string
+  default     = "/healthcare-ai/argocd/git-repo"
+}
+
 variable "helm_repo_secret_path" {
   description = "Secrets Manager path for private Helm repository token"
   type        = string

@@ -25,6 +25,7 @@ ARGOCD_ID="${ARGOCD_SECRET_ID:-/healthcare-ai/argocd/admin}"
 GRAFANA_ID="${GRAFANA_SECRET_ID:-/healthcare-ai/grafana/admin}"
 APP_ID="${APP_SECRET_ID:-/healthcare-ai/app/secrets}"
 HELM_ID="${HELM_SECRET_ID:-/healthcare-ai/helm/repo-token}"
+GIT_ID="${ARGOCD_GIT_SECRET_ID:-/healthcare-ai/argocd/git-repo}"
 FORCE="${FORCE:-0}"
 
 for c in aws jq openssl; do
@@ -105,6 +106,16 @@ jq -n --arg j "$JWT" --arg b "$BEDROCK" --arg o "$OPENAI" \
   '{jwt_signing_key:$j,bedrock_api_key:$b,openai_api_key:$o}' > "$TMP"
 unset JWT BEDROCK OPENAI
 put "$APP_ID"
+
+# ── ArgoCD Git token (needed while the repo is private) ──────────────────────
+echo ">> ArgoCD Git access (private repo)"
+echo "   Use a fine-grained GitHub PAT: this repo only, Contents: Read-only."
+GT="$(prompt_secret 'GitHub read-only token')"
+if [[ -n "$GT" ]]; then
+  jq -n --arg t "$GT" '{username:"git",token:$t}' > "$TMP"
+  unset GT
+  put "$GIT_ID"
+fi
 
 # ── Helm repo token (optional) ───────────────────────────────────────────────
 read -r -p ">> Using a private Helm repo? [y/N] " USE_HELM </dev/tty
