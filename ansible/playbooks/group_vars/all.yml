@@ -1,6 +1,6 @@
 # group_vars/all.yml — Static defaults and Secrets Manager ARN references.
 # Actual secret values are NEVER stored here; they are fetched at playbook
-# runtime via community.aws.aws_secret using the ARNs below.
+# runtime via the amazon.aws.secretsmanager_secret lookup using the ARNs below.
 #
 # This file is overwritten by scripts/terraform-to-ansible.sh after each
 # terraform apply. The ARNs below are seeds for local development.
@@ -24,18 +24,13 @@ secrets_reader_policy_arn: ""
 # ── Secrets Manager ARNs ──────────────────────────────────────────────────────
 # Values are fetched at runtime — example task:
 #
-#   - name: Read ArgoCD password
-#     community.aws.aws_secret:
-#       name: "{{ argocd_secret_arn }}"
-#       region: "{{ aws_region }}"
-#     register: argocd_raw
-#     no_log: true
-#
-#   - name: Set argocd_admin_password fact
-#     set_fact:
-#       argocd_admin_password: "{{ (argocd_raw.secret | from_json).password }}"
+#   - name: Read ArgoCD secret
+#     ansible.builtin.set_fact:
+#       argocd_secret: "{{ lookup('amazon.aws.secretsmanager_secret', argocd_secret_arn, region=aws_region) | from_json }}"
 #     no_log: true
 
 argocd_secret_arn: ""
 app_secret_arn: ""
 helm_repo_secret_arn: ""
+grafana_secret_arn: ""
+argocd_git_secret_arn: ""

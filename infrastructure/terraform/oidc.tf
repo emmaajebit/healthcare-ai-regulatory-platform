@@ -132,9 +132,9 @@ resource "aws_iam_role_policy" "terraform_deployer" {
         Resource = "*"
       },
       {
-        Sid    = "IAMPassRole"
-        Effect = "Allow"
-        Action = ["iam:PassRole"]
+        Sid      = "IAMPassRole"
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
         Resource = "*"
         Condition = {
           StringEquals = {
@@ -150,4 +150,39 @@ resource "aws_iam_role_policy" "terraform_deployer" {
 resource "aws_iam_role_policy_attachment" "terraform_planner_readonly" {
   role       = aws_iam_role.terraform_planner.name
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}
+
+# use_lockfile: even a read-only planner must be able to create and delete the
+# state lock object (<key>.tflock) for terraform plan to run safely.
+resource "aws_iam_role_policy" "terraform_planner_lockfile" {
+  name = "state-lockfile-access"
+  role = aws_iam_role.terraform_planner.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "StateLockfile"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:DeleteObject"]
+        Resource = "arn:aws:s3:::${var.tf_state_bucket}/global/terraform.tfstate.tflock"
+      },
+      {
+        Sid       = "StateKeyRead"
+        Effect    = "Allow"
+        Action    = ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+        Resource  = ["*"]
+        Condition = { StringLike = { "kms:RequestAlias" = var.tf_state_kms_alias } }
+      }
+    ]
+  })
+}
+
+# PoC shortcut: the deployer applies the ENTIRE platform (VPC, EKS, ECR, IAM
+# roles + OIDC provider, OpenSearch Serverless, DynamoDB, Secrets Manager,
+# CloudWatch, KMS, S3) — a scoped policy for that surface is large. Attach
+# AdministratorAccess for the PoC and scope down before production use.
+resource "aws_iam_role_policy_attachment" "terraform_deployer_admin" {
+  # checkov:skip=CKV_AWS_274: PoC shortcut — the deployer applies the whole platform; scope down before production
+  role       = aws_iam_role.terraform_deployer.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }

@@ -1,75 +1,388 @@
-- name: Deploy EKS add-ons
+---
+# deploy-eks-addons.yml — Kyverno (+ Cosign/SLSA policies), ArgoCD,
+# Secrets Store CSI Driver + AWS provider, kube-prometheus-stack.
+#
+# Runs on the control machine (ansible_connection: local in the inventory) and
+# talks to the EKS API. The API must be reachable from where you run this:
+#   - public endpoint restricted to your IP (eks_public_access_cidrs), or
+#   - an SSM bastion / self-hosted runner inside the VPC (private-only endpoint).
+#
+# Prerequisites:
+#   ansible-galaxy collection install kubernetes.core amazon.aws
+#   pip install boto3 botocore kubernetes
+#   bash scripts/populate-secrets.sh     # real ArgoCD + Grafana secrets
+#   bash scripts/terraform-to-ansible.sh # inventory + ARNs
+#
+# Dry run:  ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/deploy-eks-addons.yml --check --diff
+# Real run: ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/deploy-eks-addons.yml
+#
+# Kyverno policies are applied in Audit mode by default. Once a signed image
+# from the pipeline is admitted cleanly (kubectl get policyreport -A), re-run with:
+#   -e kyverno_policy_mode=Enforce
+
+- name: Deploy EKS add-ons (Kyverno, ArgoCD, Secrets Store CSI, Monitoring)
   hosts: eks
-  gather_facts: no
+  connection: local
+  gather_facts: false
+  become: false
 
   vars_files:
     - group_vars/all.yml
 
+  vars:
+    kyverno_namespace: kyverno
+    argocd_namespace: argocd
+    monitoring_namespace: monitoring
+
+    # Pinned for reproducibility; all support Kubernetes 1.35 (EKS default here).
+    kyverno_chart_version: "3.9.2"              # Kyverno v1.19.2
+    argocd_chart_version: "10.17.2"             # Argo CD v3.6.1 (keep CI argocd CLI in step)
+    secrets_store_chart_version: "1.6.2"
+    secrets_provider_aws_chart_version: "3.1.4"
+    kube_prometheus_chart_version: "93.2.2"
+
+    kyverno_admission_replicas: 3              # needs >= 3 nodes (eks_desired_size)
+    kyverno_policy_mode: Audit                 # Audit | Enforce
+    argocd_insecure_bootstrap: true            # set false once TLS/ingress is in place
+
+    argocd_secret_id: "{{ (argocd_secret_arn | default('')) or '/healthcare-ai/argocd/admin' }}"
+    grafana_secret_id: "{{ (grafana_secret_arn | default('')) or '/healthcare-ai/grafana/admin' }}"
+    argocd_git_secret_id: "{{ (argocd_git_secret_arn | default('')) or '/healthcare-ai/argocd/git-repo' }}"
+    git_repo_url: https://github.com/emmaajebit/healthcare-ai-regulatory-platform
+
+    kyverno_policy_files:
+      - "{{ playbook_dir }}/../../kubernetes/kyverno/policies/enforce-image-signature.yaml"
+      - "{{ playbook_dir }}/../../kubernetes/kyverno/policies/enforce-slsa-provenance.yaml"
+      - "{{ playbook_dir }}/../../kubernetes/kyverno/policies/enforce-security-baseline.yaml"
+
   tasks:
-    - name: Update kubeconfig for EKS cluster
-      command: >
+    # ------------------------------------------------------------------
+    # 0. Sanity checks
+    # ------------------------------------------------------------------
+    - name: Validate kyverno_policy_mode
+      ansible.builtin.assert:
+        that: kyverno_policy_mode in ['Audit', 'Enforce']
+        fail_msg: "kyverno_policy_mode must be Audit or Enforce"
+
+    # ------------------------------------------------------------------
+    # 1. Kubeconfig — must run in --check too, or every later task targets
+    #    the wrong (or no) cluster context.
+    # ------------------------------------------------------------------
+    - name: Update kubeconfig for the EKS cluster
+      ansible.builtin.command: >
         aws eks update-kubeconfig
         --name {{ eks_cluster_name }}
         --region {{ aws_region }}
+      changed_when: false
+      check_mode: false
 
-    - name: Add Kyverno Helm repo
+    - name: Confirm the EKS API is reachable
+      ansible.builtin.command: kubectl get --raw /readyz
+      register: api_ready
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Fail early with a clear message if the API is unreachable
+      ansible.builtin.fail:
+        msg: >-
+          Cannot reach the EKS API from this machine ({{ api_ready.stderr | default('') | trim }}).
+          The endpoint is private or your IP is not in eks_public_access_cidrs.
+          Run from an SSM bastion / runner inside the VPC, or add your IP/32 and re-apply Terraform.
+      when: api_ready.rc != 0
+
+    # ------------------------------------------------------------------
+    # 2. Secrets from AWS Secrets Manager (lookup plugin, not a module)
+    # ------------------------------------------------------------------
+    - name: Read ArgoCD admin secret from Secrets Manager
+      ansible.builtin.set_fact:
+        argocd_secret: "{{ lookup('amazon.aws.secretsmanager_secret', argocd_secret_id, region=aws_region) | from_json }}"
+      no_log: true
+
+    - name: Read Grafana admin secret from Secrets Manager
+      ansible.builtin.set_fact:
+        grafana_secret: "{{ lookup('amazon.aws.secretsmanager_secret', grafana_secret_id, region=aws_region) | from_json }}"
+      no_log: true
+
+    - name: Read ArgoCD Git credentials (private repo)
+      ansible.builtin.set_fact:
+        argocd_git_secret: "{{ lookup('amazon.aws.secretsmanager_secret', argocd_git_secret_id, region=aws_region, on_missing='skip', on_denied='error') | default('{}', true) | from_json }}"
+      no_log: true
+
+    - name: Refuse placeholder or empty secrets
+      ansible.builtin.assert:
+        that:
+          - argocd_secret.password_bcrypt | default('') is match('^\$2[aby]\$')
+          - grafana_secret.password | default('') | length >= 16
+          - "'REPLACE_VIA' not in grafana_secret.password"
+        fail_msg: >-
+          ArgoCD/Grafana secrets are still placeholders or missing password_bcrypt.
+          Run: bash scripts/populate-secrets.sh
+      no_log: true
+
+    # ------------------------------------------------------------------
+    # 3. Kyverno
+    # ------------------------------------------------------------------
+    - name: Add Kyverno Helm repository
       kubernetes.core.helm_repository:
         name: kyverno
         repo_url: https://kyverno.github.io/kyverno/
 
-    - name: Install Kyverno
+    - name: Install / upgrade Kyverno
       kubernetes.core.helm:
         name: kyverno
         chart_ref: kyverno/kyverno
-        release_namespace: kyverno
+        chart_version: "{{ kyverno_chart_version }}"
+        release_namespace: "{{ kyverno_namespace }}"
         create_namespace: true
+        update_repo_cache: true
+        wait: true
+        wait_timeout: 10m
         values:
-          replicaCount: 3
+          admissionController:
+            replicas: "{{ kyverno_admission_replicas | int }}"
+          backgroundController:
+            replicas: 2
+          cleanupController:
+            replicas: 2
+          reportsController:
+            replicas: 2
 
-    - name: Add ArgoCD Helm repo
+    - name: Wait until the Kyverno admission controller is Available
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ kyverno_namespace }}"
+        name: kyverno-admission-controller
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+      when: not ansible_check_mode   # nothing is installed in --check
+
+    # ------------------------------------------------------------------
+    # 4. Kyverno policies — failureAction rendered from kyverno_policy_mode
+    # ------------------------------------------------------------------
+    # Policies contain Kyverno's own {{ ... }} JMESPath expressions, so they are
+    # never passed through Jinja: copy → rewrite failureAction → apply by src.
+    - name: Create a scratch dir for rendered policies
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: kyverno
+      register: kyverno_tmp
+      check_mode: false
+      changed_when: false
+
+    - name: Copy Kyverno policies
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ kyverno_tmp.path }}/{{ item | basename }}"
+        mode: "0600"
+      loop: "{{ kyverno_policy_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      check_mode: false
+      changed_when: false
+
+    - name: Set failureAction to {{ kyverno_policy_mode }}
+      ansible.builtin.replace:
+        path: "{{ kyverno_tmp.path }}/{{ item | basename }}"
+        regexp: 'failureAction: (Audit|Enforce)'
+        replace: "failureAction: {{ kyverno_policy_mode }}"
+      loop: "{{ kyverno_policy_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      check_mode: false
+      changed_when: false
+
+    - name: Apply Kyverno ClusterPolicies ({{ kyverno_policy_mode }} mode)
+      kubernetes.core.k8s:
+        src: "{{ kyverno_tmp.path }}/{{ item | basename }}"
+        state: present
+      loop: "{{ kyverno_policy_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      when: not ansible_check_mode   # ClusterPolicy CRD may not exist yet in --check
+
+    - name: Remove the scratch dir
+      ansible.builtin.file:
+        path: "{{ kyverno_tmp.path }}"
+        state: absent
+      check_mode: false
+      changed_when: false
+
+    # ------------------------------------------------------------------
+    # 5. ArgoCD
+    # ------------------------------------------------------------------
+    - name: Add Argo Helm repository
       kubernetes.core.helm_repository:
         name: argo
         repo_url: https://argoproj.github.io/argo-helm
 
-    - name: Install ArgoCD
+    - name: Install / upgrade ArgoCD
       kubernetes.core.helm:
         name: argocd
         chart_ref: argo/argo-cd
-        release_namespace: argocd
+        chart_version: "{{ argocd_chart_version }}"
+        release_namespace: "{{ argocd_namespace }}"
         create_namespace: true
+        update_repo_cache: true
+        wait: true
+        wait_timeout: 10m
         values:
           configs:
+            params:
+              server.insecure: "{{ argocd_insecure_bootstrap | bool }}"
             secret:
-              argocdServerAdminPassword: "{{ argocd_admin_password }}"
+              # Precomputed bcrypt hash (stable across runs → idempotent upgrades)
+              argocdServerAdminPassword: "{{ argocd_secret.password_bcrypt }}"
+          dex:
+            enabled: false
+      no_log: true
 
-    - name: Install Secrets Store CSI Driver
+    - name: Wait for the ArgoCD server
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ argocd_namespace }}"
+        name: argocd-server
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+      when: not ansible_check_mode   # nothing is installed in --check
+
+    - name: Register the private Git repo with ArgoCD
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: repo-healthcare-ai-platform
+            namespace: "{{ argocd_namespace }}"
+            labels:
+              argocd.argoproj.io/secret-type: repository
+          type: Opaque
+          stringData:
+            type: git
+            url: "{{ git_repo_url }}"
+            username: "{{ argocd_git_secret.username | default('git') }}"
+            password: "{{ argocd_git_secret.token }}"
+      when:
+        - argocd_git_secret.token is defined
+        - "'REPLACE_VIA' not in argocd_git_secret.token"
+      no_log: true
+
+    # ------------------------------------------------------------------
+    # 6. Secrets Store CSI Driver + AWS provider
+    # ------------------------------------------------------------------
+    - name: Add Secrets Store CSI Driver Helm repository
+      kubernetes.core.helm_repository:
+        name: secrets-store-csi-driver
+        repo_url: https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
+
+    - name: Install / upgrade Secrets Store CSI Driver
       kubernetes.core.helm:
         name: secrets-store-csi-driver
         chart_ref: secrets-store-csi-driver/secrets-store-csi-driver
+        chart_version: "{{ secrets_store_chart_version }}"
         release_namespace: kube-system
+        update_repo_cache: true
+        wait: true
         values:
           syncSecret:
             enabled: true
+          enableSecretRotation: true
 
-    - name: Install AWS Secrets Manager provider
+    - name: Add AWS Secrets Manager CSI provider Helm repository (official)
+      kubernetes.core.helm_repository:
+        name: aws-secrets-manager
+        repo_url: https://aws.github.io/secrets-store-csi-driver-provider-aws
+
+    - name: Install / upgrade AWS Secrets Manager CSI provider
       kubernetes.core.helm:
-        name: aws-secrets-manager-provider
-        chart_ref: aws/eks-charts
+        name: secrets-provider-aws
+        chart_ref: aws-secrets-manager/secrets-store-csi-driver-provider-aws
+        chart_version: "{{ secrets_provider_aws_chart_version }}"
         release_namespace: kube-system
+        update_repo_cache: true
+        wait: true
+        values:
+          # The driver is installed (and pinned) by the task above; the
+          # provider chart would otherwise install a second, conflicting copy.
+          secrets-store-csi-driver:
+            install: false
 
-    - name: Add Prometheus Helm repo
+    # ------------------------------------------------------------------
+    # 7. Monitoring (own Grafana credentials — never the ArgoCD password)
+    # ------------------------------------------------------------------
+    - name: Add Prometheus community Helm repository
       kubernetes.core.helm_repository:
         name: prometheus-community
         repo_url: https://prometheus-community.github.io/helm-charts
 
-    - name: Install Prometheus + Grafana stack
+    - name: Install / upgrade kube-prometheus-stack
       kubernetes.core.helm:
         name: kube-prometheus-stack
         chart_ref: prometheus-community/kube-prometheus-stack
-        release_namespace: monitoring
+        chart_version: "{{ kube_prometheus_chart_version }}"
+        release_namespace: "{{ monitoring_namespace }}"
         create_namespace: true
+        update_repo_cache: true
+        wait: true
+        wait_timeout: 15m
+        values:
+          grafana:
+            adminUser: "{{ grafana_secret.username | default('admin') }}"
+            adminPassword: "{{ grafana_secret.password }}"
+          prometheus:
+            prometheusSpec:
+              retention: 15d
+      no_log: true
 
+    # ------------------------------------------------------------------
+    # 8. ArgoCD App-of-Apps
+    # ------------------------------------------------------------------
     - name: Apply ArgoCD App-of-Apps
       kubernetes.core.k8s:
         src: "{{ playbook_dir }}/../../kubernetes/argocd/app-of-apps.yaml"
         state: present
+        namespace: "{{ argocd_namespace }}"
+      when: not ansible_check_mode   # Application CRD may not exist yet in --check
+
+    # ------------------------------------------------------------------
+    # 9. Summary
+    # ------------------------------------------------------------------
+    - name: Collect Helm releases
+      kubernetes.core.helm_info:
+        name: "{{ item.name }}"
+        release_namespace: "{{ item.ns }}"
+      loop:
+        - { name: kyverno, ns: "{{ kyverno_namespace }}" }
+        - { name: argocd, ns: "{{ argocd_namespace }}" }
+        - { name: secrets-store-csi-driver, ns: kube-system }
+        - { name: secrets-provider-aws, ns: kube-system }
+        - { name: kube-prometheus-stack, ns: "{{ monitoring_namespace }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      register: helm_releases
+      check_mode: false
+
+    - name: Show release status
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.name }} →
+          {{ item.status.status | default('not installed') }}
+          ({{ item.status.chart | default('-') }})
+      loop: "{{ helm_releases.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Next step
+      ansible.builtin.debug:
+        msg: >-
+          Kyverno policies are in {{ kyverno_policy_mode }} mode.
+          {{ (kyverno_policy_mode == 'Audit') | ternary(
+             'Check `kubectl get policyreport -A`, then re-run with -e kyverno_policy_mode=Enforce.',
+             'Admission is now enforced.') }}

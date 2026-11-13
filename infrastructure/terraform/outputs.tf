@@ -78,6 +78,18 @@ output "app_secret_arn" {
   sensitive   = true
 }
 
+output "grafana_secret_arn" {
+  description = "Secrets Manager ARN for Grafana admin credentials (Ansible fetches at deploy time)"
+  value       = aws_secretsmanager_secret.grafana.arn
+  sensitive   = true
+}
+
+output "argocd_git_secret_arn" {
+  description = "Secrets Manager ARN for ArgoCD's GitHub repo token"
+  value       = aws_secretsmanager_secret.argocd_git.arn
+  sensitive   = true
+}
+
 output "helm_repo_secret_arn" {
   description = "Secrets Manager ARN for private Helm repository token"
   value       = aws_secretsmanager_secret.helm_repo.arn

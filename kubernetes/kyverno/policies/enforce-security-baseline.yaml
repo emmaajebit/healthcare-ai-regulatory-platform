@@ -2,16 +2,35 @@ apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: enforce-security-baseline
+  annotations:
+    policies.kyverno.io/title: Pod Security Baseline (non-root, read-only, limits)
+    policies.kyverno.io/description: >-
+      Application pods must run as non-root with a read-only root filesystem,
+      no privilege escalation, all capabilities dropped, and CPU/memory limits.
+      Platform namespaces are excluded: the CSI driver, node-exporter, Kyverno
+      and ArgoCD legitimately need privileges this policy would block.
 spec:
-  validationFailureAction: Enforce
+  # failureAction is set per rule (spec.validationFailureAction is deprecated).
+  background: true
   rules:
     - name: require-non-root
       match:
         any:
           - resources:
               kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: &platform_namespaces
+                - kube-system
+                - kube-node-lease
+                - kube-public
+                - kyverno
+                - argocd
+                - monitoring
       validate:
-        message: "Containers must not run as root."
+        failureAction: Enforce
+        message: "Containers must run as non-root, read-only root FS, no privilege escalation, all capabilities dropped."
         pattern:
           spec:
             securityContext:
@@ -28,7 +47,12 @@ spec:
         any:
           - resources:
               kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: *platform_namespaces
       validate:
+        failureAction: Enforce
         message: "All containers must have CPU and memory limits."
         pattern:
           spec:

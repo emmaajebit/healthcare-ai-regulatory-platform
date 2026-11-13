@@ -40,16 +40,27 @@ provider "aws" {
 # ─── Modules ──────────────────────────────────────────────────────────────────
 
 module "vpc" {
-  source       = "./modules/vpc"
-  project_name = var.project_name
-  environment  = var.environment
+  source          = "./modules/vpc"
+  project_name    = var.project_name
+  environment     = var.environment
+  log_kms_key_arn = aws_kms_key.secrets.arn
 }
 
 module "eks" {
-  source       = "./modules/eks"
-  project_name = var.project_name
-  vpc_id       = module.vpc.vpc_id
-  subnet_ids   = module.vpc.private_subnet_ids
+  source              = "./modules/eks"
+  project_name        = var.project_name
+  vpc_id              = module.vpc.vpc_id
+  subnet_ids          = module.vpc.private_subnet_ids
+  secrets_kms_key_arn = aws_kms_key.secrets.arn
+
+  eks_version            = var.eks_version
+  endpoint_public_access = var.eks_endpoint_public_access
+  public_access_cidrs    = var.eks_public_access_cidrs
+  instance_types         = var.eks_instance_types
+  desired_size           = var.eks_desired_size
+  min_size               = var.eks_min_size
+  max_size               = var.eks_max_size
+  admin_role_arns        = [aws_iam_role.terraform_deployer.arn]
 }
 
 module "ecr" {
@@ -67,6 +78,61 @@ module "opensearch_serverless" {
 
 resource "aws_s3_bucket" "worm_audit" {
   bucket = "${var.project_name}-worm-audit-${var.environment}"
+
+  # Object Lock requires versioning enabled from creation (CKV_AWS_21).
+  object_lock_enabled = true
+
+  # Audit evidence must never be destroyed by Terraform. NOTE: this makes a
+  # plain `terraform destroy` abort entirely — use `make destroy`, which
+  # removes the WORM resources from state first (the bucket is retained).
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "worm" {
+  bucket = aws_s3_bucket.worm_audit.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# CKV2_AWS_6: block all public access on the audit bucket.
+resource "aws_s3_bucket_public_access_block" "worm" {
+  bucket                  = aws_s3_bucket.worm_audit.id
+  block_public_acls       = true
+  ignore_public_acls      = true
+  block_public_policy     = true
+  restrict_public_buckets = true
+}
+
+# CKV2_AWS_61: lifecycle — noncurrent versions expire only after the full
+# WORM retention period (Object Lock COMPLIANCE prevents earlier deletion).
+resource "aws_s3_bucket_lifecycle_configuration" "worm" {
+  bucket = aws_s3_bucket.worm_audit.id
+  rule {
+    id     = "expire-noncurrent-after-retention"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+    noncurrent_version_expiration {
+      noncurrent_days = var.worm_retention_days
+    }
+  }
+
+  # Audit objects are rarely read after the first month; Intelligent-Tiering
+  # cuts storage cost without retrieval fees or minimum-duration penalties.
+  rule {
+    id     = "intelligent-tiering"
+    status = "Enabled"
+    filter {}
+    transition {
+      days          = 0
+      storage_class = "INTELLIGENT_TIERING"
+    }
+  }
 }
 
 resource "aws_s3_bucket_object_lock_configuration" "worm" {
@@ -83,8 +149,10 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "worm" {
   bucket = aws_s3_bucket.worm_audit.id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "aws:kms"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.secrets.arn
     }
+    bucket_key_enabled = true
   }
 }
 
@@ -108,5 +176,10 @@ resource "aws_dynamodb_table" "audit_log" {
   }
 
   point_in_time_recovery { enabled = true }
-  server_side_encryption  { enabled = true }
+
+  # CKV_AWS_119: encrypt the audit table with the platform CMK.
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = aws_kms_key.secrets.arn
+  }
 }

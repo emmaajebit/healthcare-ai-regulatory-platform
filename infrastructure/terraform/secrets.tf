@@ -10,6 +10,43 @@ resource "aws_kms_key" "secrets" {
   deletion_window_in_days = 14
   enable_key_rotation     = true
   tags                    = merge(local.common_tags, { Name = "${var.project_name}-secrets-kms" })
+
+  # CKV2_AWS_64: explicit key policy — the account root retains full control
+  # and access is delegated through IAM policies (e.g. EKS secrets encryption).
+  # Service principals below need direct key access (IAM does not apply to them):
+  #   - CloudWatch Logs encrypts the VPC flow-log group
+  #   - EKS uses grants for Kubernetes secrets envelope encryption
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "EnableIAMUserPermissions"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${var.aws_account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "AllowCloudWatchLogs"
+        Effect    = "Allow"
+        Principal = { Service = "logs.${var.aws_region}.amazonaws.com" }
+        Action    = ["kms:GenerateDataKey*", "kms:Decrypt"]
+        Resource  = "*"
+        Condition = {
+          ArnEquals = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/vpc/${var.project_name}-flow-logs"
+          }
+        }
+      },
+      {
+        Sid       = "AllowEKSSecretsEncryption"
+        Effect    = "Allow"
+        Principal = { Service = "eks.${var.aws_region}.amazonaws.com" }
+        Action    = ["kms:CreateGrant", "kms:ListGrants", "kms:RevokeGrant", "kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*"]
+        Resource  = "*"
+      }
+    ]
+  })
 }
 
 resource "aws_kms_alias" "secrets" {
@@ -29,9 +66,14 @@ resource "aws_secretsmanager_secret" "argocd" {
 
 resource "aws_secretsmanager_secret_version" "argocd" {
   secret_id = aws_secretsmanager_secret.argocd.id
+  # password        → used by the CI `argocd login` step
+  # password_bcrypt → passed as-is to the argo-cd chart (precomputed once so
+  #                   Helm values are stable and every run is idempotent)
+  # Populate both with: bash scripts/populate-secrets.sh
   secret_string = jsonencode({
-    username = "admin"
-    password = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
+    username        = "admin"
+    password        = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
+    password_bcrypt = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
   })
 
   lifecycle {
@@ -55,6 +97,50 @@ resource "aws_secretsmanager_secret_version" "app" {
     jwt_signing_key = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
     bedrock_api_key = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
     openai_api_key  = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
+  })
+
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
+}
+
+# ── Grafana Admin Credentials (never shared with ArgoCD) ─────────────────────
+
+resource "aws_secretsmanager_secret" "grafana" {
+  name                    = var.grafana_secret_path
+  kms_key_id              = aws_kms_key.secrets.arn
+  recovery_window_in_days = var.secrets_recovery_window_days
+  description             = "Grafana admin credentials — ${var.project_name}/${var.environment}"
+  tags                    = merge(local.common_tags, { SecretType = "grafana" })
+}
+
+resource "aws_secretsmanager_secret_version" "grafana" {
+  secret_id = aws_secretsmanager_secret.grafana.id
+  secret_string = jsonencode({
+    username = "admin"
+    password = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
+  })
+
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
+}
+
+# ── ArgoCD Git Credentials (private GitHub repo) ─────────────────────────────
+
+resource "aws_secretsmanager_secret" "argocd_git" {
+  name                    = var.argocd_git_secret_path
+  kms_key_id              = aws_kms_key.secrets.arn
+  recovery_window_in_days = var.secrets_recovery_window_days
+  description             = "Read-only GitHub token for ArgoCD to pull the private repo"
+  tags                    = merge(local.common_tags, { SecretType = "argocd-git" })
+}
+
+resource "aws_secretsmanager_secret_version" "argocd_git" {
+  secret_id = aws_secretsmanager_secret.argocd_git.id
+  secret_string = jsonencode({
+    username = "git"
+    token    = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
   })
 
   lifecycle {
@@ -106,9 +192,9 @@ resource "aws_iam_policy" "secrets_reader" {
         ]
       },
       {
-        Sid    = "KMSDecrypt"
-        Effect = "Allow"
-        Action = ["kms:Decrypt", "kms:DescribeKey"]
+        Sid      = "KMSDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:DescribeKey"]
         Resource = [aws_kms_key.secrets.arn]
       },
     ]

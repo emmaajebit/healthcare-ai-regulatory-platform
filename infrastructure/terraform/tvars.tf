@@ -110,7 +110,24 @@ variable "az_count" {
 variable "eks_version" {
   description = "Kubernetes version for the EKS control plane"
   type        = string
-  default     = "1.30"
+  default     = "1.35" # 1.30 is past end of EKS extended support
+}
+
+variable "eks_endpoint_public_access" {
+  description = "Expose the EKS API publicly (restricted by eks_public_access_cidrs). false = private-only; then run Ansible/CI from inside the VPC."
+  type        = bool
+  default     = true
+}
+
+variable "eks_public_access_cidrs" {
+  description = "CIDRs allowed to reach the public EKS endpoint. Set to your IP (x.x.x.x/32). GitHub-hosted runners need 0.0.0.0/0 — prefer self-hosted runners in the VPC instead."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition     = length(var.eks_public_access_cidrs) > 0
+    error_message = "eks_public_access_cidrs must contain at least one CIDR."
+  }
 }
 
 variable "eks_instance_types" {
@@ -120,15 +137,15 @@ variable "eks_instance_types" {
 }
 
 variable "eks_desired_size" {
-  description = "Desired number of EKS worker nodes"
+  description = "Desired number of EKS worker nodes (>= 3 so Kyverno's 3 admission replicas can spread)"
   type        = number
-  default     = 2
+  default     = 3
 }
 
 variable "eks_min_size" {
   description = "Minimum number of EKS worker nodes"
   type        = number
-  default     = 1
+  default     = 3
 }
 
 variable "eks_max_size" {
@@ -171,6 +188,18 @@ variable "app_secrets_path" {
   description = "Secrets Manager path for application-layer secrets (JWT key, API keys)"
   type        = string
   default     = "/healthcare-ai/app/secrets"
+}
+
+variable "grafana_secret_path" {
+  description = "Secrets Manager path for Grafana admin credentials (separate from ArgoCD)"
+  type        = string
+  default     = "/healthcare-ai/grafana/admin"
+}
+
+variable "argocd_git_secret_path" {
+  description = "Secrets Manager path for the read-only GitHub token ArgoCD uses to pull this (private) repo"
+  type        = string
+  default     = "/healthcare-ai/argocd/git-repo"
 }
 
 variable "helm_repo_secret_path" {

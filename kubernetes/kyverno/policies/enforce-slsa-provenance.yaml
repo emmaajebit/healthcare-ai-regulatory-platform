@@ -13,7 +13,7 @@ metadata:
       This enforces supply-chain integrity at the cluster admission gate —
       any image without a valid, traceable provenance is rejected.
 spec:
-  validationFailureAction: Enforce
+  # failureAction is set per rule (spec.validationFailureAction is deprecated).
   background: false
   rules:
     - name: verify-slsa-provenance-attestation
@@ -23,11 +23,13 @@ spec:
               kinds: [Pod]
               namespaces:
                 - default
+                - healthcare   # ArgoCD deploys java-healthcare-app here
                 - production
                 - staging
       verifyImages:
         - imageReferences:
             - "*"
+          failureAction: Enforce
           attestations:
             - predicateType: "https://slsa.dev/provenance/v1"
               attestors:

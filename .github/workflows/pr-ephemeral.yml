@@ -14,16 +14,20 @@ env:
   NS: pr-${{ github.event.number }}
 
 jobs:
+  # Opt-in: needs the AWS bootstrap AND a role whose OIDC trust allows
+  # pull_request tokens (the deployer role trusts refs/heads/main only).
+  # Set repo variables ENABLE_PR_PREVIEWS=true and PR_PREVIEW_ROLE_ARN.
+  # Until then these jobs are skipped, not failed.
   deploy-ephemeral:
-    if: github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    if: github.event.action != 'closed' && vars.ENABLE_PR_PREVIEWS == 'true' && vars.PR_PREVIEW_ROLE_ARN != ''
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Authenticate to AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: ${{ vars.PR_PREVIEW_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Update kubeconfig for EKS
@@ -44,12 +48,24 @@ jobs:
           kubectl apply -f kubernetes/network-policies/default-deny.yaml \
             -n ${{ env.NS }}
 
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push PR image
+        run: |
+          IMAGE="${{ steps.ecr-login.outputs.registry }}/healthcare-ai/java-healthcare-app"
+          docker build -t "$IMAGE:pr-${{ github.event.number }}-${{ github.sha }}" .
+          docker push "$IMAGE:pr-${{ github.event.number }}-${{ github.sha }}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
       - name: Deploy app to ephemeral namespace
         run: |
           helm upgrade --install java-healthcare-app-${{ env.NS }} \
             kubernetes/helm/java-healthcare-app \
             --namespace ${{ env.NS }} \
-            --set image.tag=${{ github.sha }} \
+            --set image.repository="$IMAGE" \
+            --set image.tag=pr-${{ github.event.number }}-${{ github.sha }} \
             --wait --timeout 120s
 
       - name: Run integration tests
@@ -71,13 +87,13 @@ jobs:
             })
 
   teardown-ephemeral:
-    if: github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    if: github.event.action == 'closed' && vars.ENABLE_PR_PREVIEWS == 'true' && vars.PR_PREVIEW_ROLE_ARN != ''
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Authenticate to AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: ${{ vars.PR_PREVIEW_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Update kubeconfig for EKS

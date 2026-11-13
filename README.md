@@ -100,6 +100,38 @@ Developer Push
 
 ## Quick Start
 
+### Demo in one command
+
+The fastest path for a demo — bootstraps AWS, applies Terraform, and wires up
+GitHub Actions keyless auth in one shot (requires admin AWS credentials locally):
+
+```bash
+bash scripts/bootstrap-aws.sh            # + optional: ARGOCD_SERVER=argocd.example:443 SEED_SECRETS=1
+make secrets                             # real ArgoCD (+bcrypt), Grafana, JWT, API keys — BEFORE k8s
+make serverless                          # Bedrock validator + compliance aggregator Lambdas
+make k8s                                 # syncs TF outputs → Ansible, installs Kyverno (Audit), ArgoCD, CSI, Prometheus
+make k8s-enforce                         # once the signed image is admitted cleanly: Kyverno → Enforce
+```
+
+After that, every push to `main` runs the full 10-stage keyless pipeline
+(build → RAG validation → Trivy → Checkov → SLSA → Cosign → ArgoCD → k6 → WORM report),
+and every infrastructure change runs fmt/validate/plan/apply through the
+`Terraform` workflow's OIDC roles.
+
+Until the one-time bootstrap runs (and sets the `AWS_*` repository variables),
+the AWS-dependent pipeline stages are **skipped, not failed** — credential-free
+checks (fmt, validate, Checkov) still run green on every push.
+
+> PoC tradeoffs, documented inline in the code: the EKS API endpoint is public
+> so GitHub-hosted runners can reach it — narrow it with `eks_public_access_cidrs`,
+> or for production set `eks_endpoint_public_access=false`, run Ansible from an
+> SSM bastion in the VPC, and point the `DEPLOY_RUNNER` repo variable at a
+> self-hosted runner in the VPC. The deployer role gets cluster access through an
+> EKS access entry and has AdministratorAccess in AWS, and a handful of
+> Checkov checks are skipped in `infrastructure/terraform/.checkov.yml`.
+> The WORM bucket's Object Lock compliance retention also prevents deleting
+> the audit objects before `worm_retention_days` — plan cleanup accordingly.
+
 ### Step 1 — Clone and bootstrap the toolchain
 
 ```bash
@@ -118,16 +150,24 @@ sudo bash scripts/install-devops-tools.sh
 > After OIDC roles are created, GitHub Actions authenticates keylessly — no secrets needed.
 
 ```bash
-aws configure
-# Enter: Access Key ID, Secret Access Key, region (us-east-1), output (json)
+# Preferred: short-lived credentials via IAM Identity Center
+aws configure sso && aws sso login
+
+# Fallback: `aws configure` with temporary admin keys — delete the access key
+# in IAM as soon as bootstrap is done (CI never needs it).
 ```
 
 ### Step 3 — Create the Terraform state bucket
 
 S3 native locking (`use_lockfile = true`) requires **versioning enabled** on the bucket.
-No DynamoDB table is needed.
+No DynamoDB table is needed. `scripts/bootstrap-aws.sh` does all of this idempotently
+(KMS key with rotation, versioning, SSE-KMS, public-access block). Manual equivalent:
 
 ```bash
+KEY_ID=$(aws kms create-key --description "healthcare-ai terraform state" --query KeyMetadata.KeyId --output text)
+aws kms enable-key-rotation --key-id "$KEY_ID"
+aws kms create-alias --alias-name alias/healthcare-ai-terraform-state --target-key-id "$KEY_ID"
+
 aws s3api create-bucket \
   --bucket healthcare-ai-terraform-state \
   --region us-east-1
@@ -146,6 +186,11 @@ aws s3api put-bucket-encryption \
       }
     }]
   }'
+
+aws s3api put-public-access-block \
+  --bucket healthcare-ai-terraform-state \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 ```
 
 ### Step 4 — Provision AWS infrastructure
@@ -156,7 +201,8 @@ terraform init
 
 terraform apply \
   -var="aws_account_id=$(aws sts get-caller-identity --query Account --output text)" \
-  -var="github_org=emmaajebit"
+  -var="github_org=emmaajebit" \
+  -var='eks_public_access_cidrs=["<your-ip>/32"]'   # omit only if CI uses GitHub-hosted runners
 
 # Provisions: VPC, EKS, ECR, OpenSearch Serverless,
 #             S3 WORM bucket, DynamoDB audit log,
@@ -178,6 +224,8 @@ terraform output terraform_deployer_role_arn
 |----------|-------|
 | `AWS_ROLE_TO_ASSUME` | ARN from `terraform output terraform_deployer_role_arn` |
 | `ARGOCD_SERVER` | Your ArgoCD server URL (e.g. `argocd.internal:443`) |
+| `ENABLE_PR_PREVIEWS` / `PR_PREVIEW_ROLE_ARN` | *(optional)* turn on per-PR ephemeral namespaces; the role must trust `pull_request` OIDC tokens |
+| `DEPLOY_RUNNER` | *(optional)* label of a self-hosted runner inside the VPC for the ArgoCD + k6 jobs (needed with a private EKS endpoint) |
 
 > **No `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or `COSIGN_PRIVATE_KEY` needed.**
 > GitHub exchanges an OIDC token for both AWS STS credentials and a Sigstore Fulcio
@@ -200,36 +248,36 @@ bash scripts/terraform-to-ansible.sh
 # Secret values are NOT written — only Secrets Manager ARNs are stored
 ```
 
-### Step 8 — Deploy Kubernetes add-ons
+### Step 8 — Populate secrets in AWS Secrets Manager (before Ansible)
+
+Terraform seeds placeholders; the playbook refuses to run until they are real.
 
 ```bash
-# Ansible fetches secrets from AWS Secrets Manager at runtime
-ansible-playbook -i ansible/inventory/hosts.yml \
-  ansible/playbooks/deploy-eks-addons.yml
-
-# Deploys: Kyverno (with keyless Cosign + SLSA policies),
-#          ArgoCD, Secrets Store CSI, Prometheus/Grafana
+make secrets        # = bash scripts/populate-secrets.sh
+# ArgoCD : random password + precomputed bcrypt hash (password_bcrypt)
+# Grafana: its own random password (never shared with ArgoCD)
+# App    : random JWT key; Bedrock/OpenAI keys prompted silently
+# Git    : read-only GitHub PAT so ArgoCD can pull the repo while it's private
+# Values go through a 0600 temp file — nothing in argv or shell history.
 ```
 
-### Step 9 — Populate secrets in AWS Secrets Manager
+### Step 9 — Deploy Kubernetes add-ons
 
-Terraform seeds placeholder values. Replace them via CLI (or AWS Console):
+The EKS API must be reachable from where you run this (your IP in
+`eks_public_access_cidrs`, or an SSM bastion inside the VPC).
 
 ```bash
-# ArgoCD admin password
-aws secretsmanager put-secret-value \
-  --secret-id /healthcare-ai/argocd/admin \
-  --secret-string '{"username":"admin","password":"<strong-password>"}'
+ansible-galaxy collection install kubernetes.core amazon.aws
+pip install boto3 botocore kubernetes
 
-# Application secrets (JWT key, API keys)
-aws secretsmanager put-secret-value \
-  --secret-id /healthcare-ai/app/secrets \
-  --secret-string '{"jwt_signing_key":"<key>","bedrock_api_key":"<key>","openai_api_key":"<key>"}'
+make k8s-check      # dry run (--check --diff)
+make k8s            # Kyverno policies start in **Audit** mode
 
-# Helm repo token
-aws secretsmanager put-secret-value \
-  --secret-id /healthcare-ai/helm/repo-token \
-  --secret-string '{"username":"<user>","token":"<token>"}'
+kubectl get policyreport -A    # confirm the pipeline-signed image passes
+make k8s-enforce               # then flip Kyverno to Enforce
+
+# Deploys: Kyverno (keyless Cosign + SLSA + baseline policies),
+#          ArgoCD, Secrets Store CSI + AWS provider, Prometheus/Grafana
 ```
 
 ### Step 10 — Seed RAG compliance rules
@@ -242,6 +290,7 @@ make seed-rag
 ### Step 11 — Push code to trigger the pipeline
 
 ```bash
+git status          # make sure no .terraform/, *.tfvars or local outputs are staged
 git push origin main
 # Triggers the full CI/CD pipeline — OIDC auth, SLSA, Cosign keyless sign, ArgoCD deploy
 ```
@@ -308,12 +357,15 @@ cosign verify-attestation \
 
 ### Kyverno admission gate
 
-Two `ClusterPolicy` resources in `kubernetes/kyverno/policies/` enforce these checks at pod admission:
+`ClusterPolicy` resources in `kubernetes/kyverno/policies/` enforce these checks at pod admission
+(installed in Audit mode first, then switched with `make k8s-enforce`; they apply to the
+`default`, `healthcare`, `staging` and `production` namespaces — platform namespaces are excluded):
 
 | Policy | What it checks |
 |--------|---------------|
 | `enforce-image-signature` | Cosign keyless signature present, cert issued by GitHub OIDC, recorded in Rekor |
 | `enforce-slsa-provenance` | SLSA v1.0 attestation present, same keyless identity, `buildType` and `repository` match this repo |
+| `enforce-security-baseline` | non-root, read-only root FS, no privilege escalation, capabilities dropped, CPU/memory limits |
 
 Any pod that references an image without both artifacts is **rejected before scheduling**.
 
@@ -322,7 +374,7 @@ Any pod that references an image without both artifacts is **rejected before sch
 ## Authentication Model
 
 ```
-Local bootstrap       →  aws configure  (one-time only)
+Local bootstrap       →  aws sso login  (one-time only, short-lived)
 GitHub Actions apply  →  OIDC token  →  sts:AssumeRoleWithWebIdentity  →  Deployer role (main)
 GitHub Actions plan   →  OIDC token  →  sts:AssumeRoleWithWebIdentity  →  Planner role  (any branch)
 Cosign signing        →  OIDC token  →  Sigstore Fulcio cert  →  Rekor transparency log
@@ -415,7 +467,9 @@ make audit-report
 
 ```bash
 make destroy
-# Destroys all Terraform-managed AWS infrastructure
+# Removes the WORM bucket resources from state first (they carry prevent_destroy,
+# which would otherwise abort the whole destroy), then destroys everything else.
+# The WORM bucket and its evidence stay in AWS.
 ```
 
 > **Warning:** The S3 WORM bucket cannot be deleted until the retention period expires

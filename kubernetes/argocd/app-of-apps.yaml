@@ -8,7 +8,7 @@ spec:
   source:
     repoURL: https://github.com/emmaajebit/healthcare-ai-regulatory-platform
     targetRevision: main
-    path: kubernetes
+    path: kubernetes/argocd
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
