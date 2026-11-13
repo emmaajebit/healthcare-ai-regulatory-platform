@@ -66,9 +66,14 @@ resource "aws_secretsmanager_secret" "argocd" {
 
 resource "aws_secretsmanager_secret_version" "argocd" {
   secret_id = aws_secretsmanager_secret.argocd.id
+  # password        → used by the CI `argocd login` step
+  # password_bcrypt → passed as-is to the argo-cd chart (precomputed once so
+  #                   Helm values are stable and every run is idempotent)
+  # Populate both with: bash scripts/populate-secrets.sh
   secret_string = jsonencode({
-    username = "admin"
-    password = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
+    username        = "admin"
+    password        = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
+    password_bcrypt = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
   })
 
   lifecycle {
@@ -92,6 +97,28 @@ resource "aws_secretsmanager_secret_version" "app" {
     jwt_signing_key = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
     bedrock_api_key = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
     openai_api_key  = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
+  })
+
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
+}
+
+# ── Grafana Admin Credentials (never shared with ArgoCD) ─────────────────────
+
+resource "aws_secretsmanager_secret" "grafana" {
+  name                    = var.grafana_secret_path
+  kms_key_id              = aws_kms_key.secrets.arn
+  recovery_window_in_days = var.secrets_recovery_window_days
+  description             = "Grafana admin credentials — ${var.project_name}/${var.environment}"
+  tags                    = merge(local.common_tags, { SecretType = "grafana" })
+}
+
+resource "aws_secretsmanager_secret_version" "grafana" {
+  secret_id = aws_secretsmanager_secret.grafana.id
+  secret_string = jsonencode({
+    username = "admin"
+    password = "REPLACE_VIA_AWS_CONSOLE_OR_CLI"
   })
 
   lifecycle {

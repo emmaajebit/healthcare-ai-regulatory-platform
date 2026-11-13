@@ -216,7 +216,10 @@ jobs:
   argocd-deploy:
     if: vars.AWS_ROLE_TO_ASSUME != '' && vars.ARGOCD_SERVER != ''
     needs: cosign-sign
-    runs-on: ubuntu-latest
+    # Must be able to reach ArgoCD and the EKS API. With a private endpoint,
+    # set repo variable DEPLOY_RUNNER to the label of a self-hosted runner
+    # inside the VPC; defaults to GitHub-hosted for the public-endpoint PoC.
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     # GitOps image promotion commits the new SHA to the ArgoCD Application
     # manifest in git, so this job needs write access to the repository.
     permissions:
@@ -233,7 +236,7 @@ jobs:
       - name: Install ArgoCD CLI
         run: |
           curl -fsSL -o /usr/local/bin/argocd \
-            https://github.com/argoproj/argo-cd/releases/download/v2.11.3/argocd-linux-amd64
+            https://github.com/argoproj/argo-cd/releases/download/v3.6.1/argocd-linux-amd64  # matches argo-cd chart 10.17.2
           chmod +x /usr/local/bin/argocd
 
       - name: Fetch ArgoCD token from Secrets Manager
@@ -272,7 +275,7 @@ jobs:
   load-test:
     if: vars.AWS_ROLE_TO_ASSUME != ''
     needs: argocd-deploy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -307,7 +310,8 @@ jobs:
 # ─── Stage 10: WORM Compliance Report ────────────────────────────────────────
   worm-report:
     if: vars.AWS_ROLE_TO_ASSUME != ''
-    needs: load-test
+    # build-and-push must be listed for its outputs (image/digest) to be visible here.
+    needs: [build-and-push, load-test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -320,6 +324,8 @@ jobs:
 
       - name: Generate and store WORM audit report
         env:
+          WORM_BUCKET:  healthcare-ai-worm-audit-dev
+          AUDIT_TABLE:  healthcare-ai-bedrock-audit-log
           IMAGE_DIGEST: ${{ needs.build-and-push.outputs.digest }}
           IMAGE_REF:    ${{ needs.build-and-push.outputs.image }}
         run: bash scripts/generate-audit-proof.sh

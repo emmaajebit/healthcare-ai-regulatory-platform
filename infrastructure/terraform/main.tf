@@ -52,6 +52,15 @@ module "eks" {
   vpc_id              = module.vpc.vpc_id
   subnet_ids          = module.vpc.private_subnet_ids
   secrets_kms_key_arn = aws_kms_key.secrets.arn
+
+  eks_version            = var.eks_version
+  endpoint_public_access = var.eks_endpoint_public_access
+  public_access_cidrs    = var.eks_public_access_cidrs
+  instance_types         = var.eks_instance_types
+  desired_size           = var.eks_desired_size
+  min_size               = var.eks_min_size
+  max_size               = var.eks_max_size
+  admin_role_arns        = [aws_iam_role.terraform_deployer.arn]
 }
 
 module "ecr" {
@@ -72,6 +81,13 @@ resource "aws_s3_bucket" "worm_audit" {
 
   # Object Lock requires versioning enabled from creation (CKV_AWS_21).
   object_lock_enabled = true
+
+  # Audit evidence must never be destroyed by Terraform. NOTE: this makes a
+  # plain `terraform destroy` abort entirely — use `make destroy`, which
+  # removes the WORM resources from state first (the bucket is retained).
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "worm" {
@@ -105,6 +121,18 @@ resource "aws_s3_bucket_lifecycle_configuration" "worm" {
       noncurrent_days = var.worm_retention_days
     }
   }
+
+  # Audit objects are rarely read after the first month; Intelligent-Tiering
+  # cuts storage cost without retrieval fees or minimum-duration penalties.
+  rule {
+    id     = "intelligent-tiering"
+    status = "Enabled"
+    filter {}
+    transition {
+      days          = 0
+      storage_class = "INTELLIGENT_TIERING"
+    }
+  }
 }
 
 resource "aws_s3_bucket_object_lock_configuration" "worm" {
@@ -121,8 +149,10 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "worm" {
   bucket = aws_s3_bucket.worm_audit.id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "aws:kms"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.secrets.arn
     }
+    bucket_key_enabled = true
   }
 }
 

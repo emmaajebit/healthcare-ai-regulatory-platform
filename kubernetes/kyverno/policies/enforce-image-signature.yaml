@@ -12,7 +12,9 @@ metadata:
       the certificate is issued transiently and recorded in Rekor's public
       transparency log.
 spec:
-  validationFailureAction: Enforce
+  # failureAction is set per rule (spec.validationFailureAction is deprecated).
+  # The Ansible playbook rewrites it to Audit on first install; flip to Enforce
+  # with -e kyverno_policy_mode=Enforce once the signed image is admitted.
   background: false
   rules:
     - name: verify-cosign-keyless-signature
@@ -22,11 +24,13 @@ spec:
               kinds: [Pod]
               namespaces:
                 - default
+                - healthcare   # ArgoCD deploys java-healthcare-app here
                 - production
                 - staging
       verifyImages:
         - imageReferences:
             - "*"
+          failureAction: Enforce
           mutateDigest: true      # pin image tag to digest after verification
           verifyDigest: true      # reject images referenced by mutable tags only
           required: true
@@ -35,7 +39,7 @@ spec:
               entries:
                 - keyless:
                     # Subject matches the workflow file that ran cosign sign.
-                    # The wildcard on @refs/... allows both main and release branches.
+                    # Pinned to main: only images signed by the main-branch run are admitted.
                     subject: >-
                       https://github.com/emmaajebit/healthcare-ai-regulatory-platform/.github/workflows/cicd-pipeline.yml@refs/heads/main
                     issuer: "https://token.actions.githubusercontent.com"

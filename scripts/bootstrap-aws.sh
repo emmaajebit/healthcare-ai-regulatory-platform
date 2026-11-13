@@ -11,7 +11,8 @@
 #   5. Points the ArgoCD Application manifest at the real ECR registry
 #   6. Optionally seeds a real ArgoCD admin password in Secrets Manager
 #
-# Prerequisites: aws CLI (admin credentials), terraform >= 1.10, gh CLI.
+# Prerequisites: aws CLI (short-lived admin credentials — prefer `aws sso login`),
+#                terraform >= 1.10, gh CLI.
 # After this script succeeds, GitHub Actions authenticates keylessly —
 # no long-lived AWS credentials are stored anywhere.
 set -euo pipefail
@@ -43,6 +44,7 @@ if ! aws kms describe-key --key-id "$KMS_ALIAS" >/dev/null 2>&1; then
   KEY_ARN="$(aws kms create-key --description "healthcare-ai terraform state encryption" \
     --query KeyMetadata.Arn --output text)"
   aws kms create-alias --alias-name "$KMS_ALIAS" --target-key-id "$KEY_ARN"
+  aws kms enable-key-rotation --key-id "$KEY_ARN"
 else
   echo ">> KMS alias $KMS_ALIAS already exists"
 fi
@@ -101,28 +103,21 @@ if grep -q "REPLACE_ECR_REGISTRY" "$ARGOCD_APP"; then
   echo "   Commit this change so ArgoCD picks it up from git."
 fi
 
-# ── 6. Map the deployer role into the cluster (aws-auth) ─────────────────────
-# AWS authentication alone does not grant Kubernetes access: GitHub-hosted
-# runners (kubectl/argocd) need the deployer role mapped in the aws-auth
-# ConfigMap. The EKS API endpoint is public for this PoC (see modules/eks).
-echo ">> Mapping deployer role into EKS aws-auth ConfigMap"
-aws eks update-kubeconfig --name "$(terraform output -raw eks_cluster_name)" --region "$REGION"
-kubectl -n kube-system patch configmap aws-auth --type merge -p \
-  '{"data":{"mapRoles":"- rolearn: '"$DEPLOYER_ARN"'\n  username: github-actions\n  groups:\n  - system:masters\n"}}'
+# ── 6. Cluster access for CI ─────────────────────────────────────────────────
+# The deployer role is granted cluster-admin through an EKS access entry in
+# Terraform (modules/eks: aws_eks_access_entry). The old aws-auth merge-patch
+# here REPLACED mapRoles and dropped the node-role mapping, so it was removed.
 
-# ── 7. Optional: seed an ArgoCD admin password in Secrets Manager ─────────────
-# NOTE: this stores the credential the ArgoCD CLI jobs use; it does NOT by itself
-# reconfigure a running ArgoCD instance — align it during `make k8s` (Ansible).
-if [ "${SEED_ARGOCD_PASSWORD:-}" = "1" ]; then
-  PASSWORD="$(openssl rand -base64 24 | tr -d '/+=' )"
-  aws secretsmanager put-secret-value \
-    --secret-id /healthcare-ai/argocd/admin \
-    --secret-string "{\"username\":\"admin\",\"password\":\"$PASSWORD\"}"
-  echo ">> ArgoCD admin password seeded in Secrets Manager (path: /healthcare-ai/argocd/admin)"
+# ── 7. Real secret values (ArgoCD + bcrypt hash, Grafana, JWT, API keys) ──────
+if [ "${SEED_SECRETS:-${SEED_ARGOCD_PASSWORD:-}}" = "1" ]; then
+  bash "$PROJECT_ROOT/scripts/populate-secrets.sh"
+else
+  echo "   (skipped secrets — run: bash scripts/populate-secrets.sh  BEFORE make k8s)"
 fi
 
 echo ""
 echo ">> Bootstrap complete."
-echo "   Next: make serverless && bash scripts/terraform-to-ansible.sh && make k8s"
+echo "   Next: bash scripts/populate-secrets.sh (if skipped) && make serverless"
+echo "         bash scripts/terraform-to-ansible.sh && make k8s"
 echo "   Then:   bash scripts/apply-gitops.sh   # registers the ArgoCD Applications"
 echo "   Then push to main — the CI/CD pipeline now runs fully keyless."
